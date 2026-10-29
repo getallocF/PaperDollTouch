@@ -326,11 +326,15 @@ void PaperDollTouchMod::saveRuntimeSettingsToConfig() noexcept {
     mConfig.paperDollFollowCursor = mState.paperDollFollowCursor.load(std::memory_order_relaxed);
     mConfig.touchInputMode = mState.trackpadMode.load(std::memory_order_relaxed) ? "trackpad" : "direct";
 
+    if (mConfigFile.has_value()) {
+        mConfigFile->value() = mConfig;
+    }
+
     std::error_code ec;
     const auto cfgPath = getSelf().getConfigDir() / "config.json";
     std::ofstream out(cfgPath, std::ios::binary | std::ios::trunc);
     if (out) {
-        out << pl::config::toJson(mConfig).dump(2) << '\n';
+        out << pl::config::defaultJson(mConfig).dump(2) << '\n';
     }
 }
 
