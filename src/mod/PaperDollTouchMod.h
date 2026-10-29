@@ -19,18 +19,17 @@ struct McVec2 {
 
 // Minecraft Bedrock ActorRenderData layout prefix (64-bit ARM64, STL-free POD prefix)
 struct McActorRenderDataPrefix {
-    void *mActor{nullptr};           // +0x00
-    const void *mItemStack{nullptr}; // +0x08
-    float posX{0.0f};                // +0x10
-    float posY{0.0f};                // +0x14
-    float posZ{0.0f};                // +0x18
-    float rotPitch{0.0f};            // +0x1C (rotation.x)
-    float rotYaw{0.0f};              // +0x20 (rotation.y)
-    float headRotPitch{0.0f};        // +0x24 (mHeadRot.x)
-    float headRotYaw{0.0f};          // +0x28 (mHeadRot.y)
-    bool glint{false};               // +0x2C
-    bool mIgnoreLighting{false};     // +0x2D
-    bool mIsInUI{false};             // +0x2E
+    void *mActor{nullptr};           // +0x00 (Actor*)
+    float posX{0.0f};                // +0x08 (Vec3 mPosition.x)
+    float posY{0.0f};                // +0x0C (Vec3 mPosition.y)
+    float posZ{0.0f};                // +0x10 (Vec3 mPosition.z)
+    float rotPitch{0.0f};            // +0x14 (Vec2 mRotation.x = pitch)
+    float rotYaw{0.0f};              // +0x18 (Vec2 mRotation.y = bodyYaw)
+    float headRotPitch{0.0f};        // +0x1C (Vec2 mHeadRot.x = headPitch)
+    float headRotYaw{0.0f};          // +0x20 (Vec2 mHeadRot.y = headYaw)
+    bool glint{false};               // +0x24
+    bool mIgnoreLighting{false};     // +0x25
+    bool mIsInUI{false};             // +0x26
 };
 
 // Lock-free atomic runtime state shared between Input Thread and RenderDragon UI Thread
@@ -39,6 +38,12 @@ struct RuntimeTouchState {
     std::atomic<bool> hookInstalled{false};
     std::atomic<bool> inventoryPreviewVisible{false};
     std::atomic<bool> inInventoryRenderPass{false};
+    std::atomic<bool> bodyRotGetterCalledThisPass{false};
+    std::atomic<bool> headRotGetterCalledThisPass{false};
+
+    // Saved ActorRotationComponent pointer & values during active UI render pass
+    float *activeActorRotCompFloats{nullptr};
+    float savedActorRotCompFloats[4]{0.0f, 0.0f, 0.0f, 0.0f};
 
     // Monotonic timestamp (ms) of the most recent Inventory LivePlayerRenderer / PaperDollRenderer render call
     std::atomic<std::int64_t> lastInventoryRenderMs{0};
@@ -65,8 +70,8 @@ struct RuntimeTouchState {
     std::atomic<float> activeBoundsMaxY{1.0f};
 
     // Cursor-Follow target and smoothed orientation deltas (degrees)
-    // Decouples Body Yaw (~26 deg) from Head Yaw (~54 deg) and Head Pitch (~34 deg)
-    // so the character's head and eyes track the finger like a PC mouse cursor.
+    // Decouples Body Yaw (~26 deg) from Head Yaw (~62 deg) and Head Pitch (~38 deg)
+    // so the character's head, neck, and eyes track the finger like a PC mouse cursor.
     std::atomic<float> targetBodyYawOffset{0.0f};
     std::atomic<float> targetHeadYawOffset{0.0f};
     std::atomic<float> targetPitchOffset{0.0f};
@@ -131,7 +136,7 @@ class PaperDollTouchMod {
         McActorRenderDataPrefix *actorRenderData
     ) noexcept;
 
-    // Detours for Mob::getInterpolatedBodyRot / getInterpolatedHeadRot / getInterpolatedBodyYaw
+    // Detours for Mob::getInterpolatedBodyRot / Actor::getInterpolatedHeadRot / Mob::getInterpolatedBodyYaw
     float onMobGetInterpolatedBodyRotDetour(const void *self, float partialTicks) noexcept;
     float onMobGetInterpolatedHeadRotDetour(const void *self, float partialTicks) noexcept;
     float onMobGetInterpolatedBodyYawDetour(const void *self, float partialTicks) noexcept;
@@ -147,6 +152,8 @@ class PaperDollTouchMod {
     void resetTouchAndOrientation(bool clearAngles) noexcept;
     void updateCursorFollowTargets(float x, float y) noexcept;
     void stepOrientationSmoothing() noexcept;
+    void applyActorPitchToComponents(const void *actorPtr) noexcept;
+    void restoreActorPitchComponents() noexcept;
     bool isPointInsidePreviewBounds(float x, float y) const noexcept;
     void writeDiagnosticProbeReport(
         bool hookReady,
