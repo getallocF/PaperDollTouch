@@ -229,18 +229,6 @@ int32_t detourAInputQueueGetEvent(void *queue, void **outEvent) noexcept {
     return PaperDollTouchMod::instance().onInputQueueGetEventDetour(queue, outEvent);
 }
 
-#if PDT_HAS_PL_INPUT
-// C++20 concept wrapper so compilation succeeds regardless of minor pl::input overload differences
-template <typename CallbackT>
-bool tryRegisterPreloaderTouchCallback(CallbackT &&cb) noexcept {
-    if constexpr (requires { pl::input::registerTouchCallback(std::forward<CallbackT>(cb)); }) {
-        pl::input::registerTouchCallback(std::forward<CallbackT>(cb));
-        return true;
-    }
-    return false;
-}
-#endif
-
 bool isValidRotationFloat(float val) noexcept {
     return std::isfinite(val) && std::fabs(val) <= 36000.0f;
 }
@@ -487,16 +475,17 @@ bool PaperDollTouchMod::tryResolveAndInstallHooks() noexcept {
 void PaperDollTouchMod::registerInputHandlers() noexcept {
     if (!mPlInputCallbackRegistered) {
 #if PDT_HAS_PL_INPUT
-        mPlInputCallbackRegistered = tryRegisterPreloaderTouchCallback(
-            [](const auto &event) -> bool {
+        pl::input::registerTouchCallback(
+            [](const pl::input::TouchEvent &event) -> bool {
                 return PaperDollTouchMod::instance().onTouchEvent(
-                    static_cast<int>(event.action),
-                    static_cast<int>(event.pointerId),
-                    static_cast<float>(event.x),
-                    static_cast<float>(event.y)
+                    event.action,
+                    event.pointerId,
+                    event.x,
+                    event.y
                 );
             }
         );
+        mPlInputCallbackRegistered = true;
 #endif
     }
 
