@@ -1,0 +1,117 @@
+================================================================================
+LAPORAN AUDIT & IMPLEMENTASI TEKNIS — PAPERDOLLTOUCH (MCBE 26.60 ARM64)
+================================================================================
+
+1. HASIL AUDIT KETIGA FILE ZIP YANG DILAMPIRKAN
+--------------------------------------------------------------------------------
+A. "PaperDollTouch.zip" (Artifact Build Terakhir yang Berhasil):
+   - Berisi `build-arm64-v8a/clange_me-0.1.0-arm64-v8a.levipack` dan
+     `build-armeabi-v7a/clange_me-0.1.0-armeabi-v7a.levipack`.
+   - Hasil bedah biner ELF pada `clange_me/libclange_me.so` (881.496 byte):
+     * Arsitektur: ELF 64-bit LSB shared object, ARM aarch64 (`EM_AARCH64`),
+       dikompilasi dengan Android NDK r28c (`clang 19.0.1`) di path runner
+       `/home/runner/work/PaperDollTouch/PaperDollTouch/build-arm64-v8a`.
+     * Dynamic dependencies (`DT_NEEDED`): `liblog.so`, `libpreloader.so`,
+       `libm.so`, `libc++_shared.so`, `libdl.so`, `libc.so`.
+     * Simbol ekspor: `PLGetModRegistration` (pada offset `.text` `0x57894`).
+     * Simbol impor dari `libpreloader.so`: `_ZN2pl3mod9NativeMod7currentEv`.
+     * TEMUAN KRITIS: Biner ini 100% masih merupakan contoh template asli
+       (`Clange Me Mod`, `libclange_me.so`, pesan `"Hello from clange_me"`).
+       Tidak ada satu pun kode rotasi karakter, input sentuh, atau hook
+       `HudPlayerRenderer::render` di dalamnya.
+
+B. "levilauncher-android-mod-template-main.zip" (Template Fondasi Build):
+   - Menggunakan CMake 3.22+ dua-tahap yang dikendalikan oleh `scripts/package.ps1`:
+     * Tahap 1 (Host): Mengompilasi `levi_config_generator` dengan
+       `-DPL_CONFIG_NO_RUNTIME` dan refleksi `Boost::pfr` + `pl::config::Schema`
+       untuk menghasilkan `config.json` dan `config.schema.json`.
+     * Tahap 2 (Android NDK): Mengompilasi shared library dengan
+       `-Wl,-z,max-page-size=16384`, men-strip simbol lokal, mengonfigurasi
+       `manifest.json` dari `manifest.json.in`, dan membungkus `.levipack`
+       dengan struktur direktori tingkat atas `<MOD_ID>/` (`manifest.json`,
+       `lib<MOD_LIBRARY_NAME>.so`, `config/config.json`, `config/config.schema.json`).
+
+C. "PaperDollTouch_CloudBuild_Source.zip" (Source Awal PaperDollTouch):
+   - Berisi logika C++20 `PaperDollTouchMod` di dalam subfolder `PapperDollTouch/`.
+   - Kelemahan pada source awal yang diperbaiki pada rilis ini:
+     1) Struktur folder bersarang (`PapperDollTouch/`) yang menyebabkan GitHub
+        Actions gagal mendeteksi `.github/workflows/build.yml` jika tidak diratakan.
+     2) `CMakeLists.txt` awal tidak menggunakan `SOURCE_SUBDIR cmake/preloader-sdk`
+        serta tidak menyediakan dependency `fmt`, `nlohmann_json`, `boost_pfr`,
+        dan `magic_enum` yang dibutuhkan oleh header `preloader-android`.
+     3) Pengemasan `.levipack` awal menaruh file langsung di root ZIP, bukan di
+        dalam folder `<MOD_ID>/` sebagaimana disyaratkan oleh LeviLauncher.
+     4) Hanya mengandalkan offset integer manual (`actorRotYawOffset` = 0) dan
+        parser JSON manual, serta belum memiliki mekanisme auto-probe simbol ELF
+        maupun jalur bebas-offset melalui `Actor::getRotation() const`.
+
+--------------------------------------------------------------------------------
+2. DAFTAR PERUBAHAN SOURCE, KONFIGURASI BUILD, DAN DEPENDENCY
+--------------------------------------------------------------------------------
+1. Fondasi Build & Dependency (`CMakeLists.txt` & `scripts/package.ps1`):
+   - Mempertahankan 100% pipeline `FetchContent` dari template yang terbukti
+     berhasil (`preloader_android` `0.2.2`, `nlohmann_json` `v3.11.3`,
+     `boost_pfr` `boost-1.88.0`, `magic_enum` `v0.9.7`, `fmt` `11.2.0`).
+   - Mengubah identitas target menjadi:
+     * `MOD_ID` = `"PaperDollTouch"`
+     * `MOD_NAME` = `"PaperDollTouch"`
+     * `MOD_LIBRARY_NAME` = `"PaperDollTouch"` -> menghasilkan `libPaperDollTouch.so`
+     * `MOD_MINECRAFT_VERSIONS` = `["1.26.*", "26.60", "1.26.60"]`
+   - Menambahkan link ke library standar NDK `libandroid.so` (`find_library(android-lib android REQUIRED)`)
+     untuk mendukung pembacaan `AInputEvent` / `AMotionEvent` secara native.
+
+2. Integrasi Skema Konfigurasi (`src/mod/Config.h`, `src/mod/Config.cpp`, `src/config_generator.cpp`):
+   - Menghapus `clange_me::ModConfig` (`"Hello from clange_me"`) dan menggantinya
+     dengan `paperdoll::ModConfig` beserta spesialisasi `pl::config::Schema<paperdoll::ModConfig>`.
+   - Mendukung pembuatan `config.json` dan `config.schema.json` secara otomatis
+     pada tahap `levi_generate_config` saat build berlangsung.
+
+3. Implementasi Rotasi Karakter Inventory (`src/mod/PaperDollTouchMod.h/.cpp`):
+   - Deteksi Area Inventory vs HUD: Memeriksa `McRectangleArea` (`x0, x1, y0, y1`)
+     pada `HudPlayerRenderer::render` (`width >= 28.0f`, `height >= 40.0f`, `x0 > 12.0f`)
+     sehingga paper doll kecil di pojok kiri atas HUD permainan tidak ikut terpengaruh.
+   - Isolasi Input Sentuh: Mengunci `activePointerId` hanya saat `AMOTION_EVENT_ACTION_DOWN`
+     atau `AMOTION_EVENT_ACTION_POINTER_DOWN` dimulai di dalam batas area preview
+     paper doll. Selalu mengembalikan `false` pada callback sentuh agar slot item,
+     tombol armor, crafting, dan kontrol UI Minecraft lainnya bekerja 100% normal.
+   - Dukungan Input Ganda: Menggunakan `pl::input::registerTouchCallback` (jika
+     tersedia pada SDK) serta fallback otomatis ke hook non-intrusif
+     `AInputQueue_getEvent` (`libandroid.so`) agar tetap menerima event sentuh
+     meskipun callback SDK tidak aktif.
+   - Multi-Tier Resolution & Scoped Rotation Override:
+     * Jalur A (Bebas-Offset): Memanggil `_ZNK5Actor11getRotationEv` (`Actor::getRotation() const`)
+       untuk memperoleh referensi `McVec2` (`pitch`, `yaw`) dari `ActorRotationComponent`,
+       serta `_ZNK5Actor11getYHeadRotEv` / `_ZN5Actor11setYHeadRotEf` untuk rotasi kepala.
+     * Jalur B (Offset Terverifikasi): Menggunakan `actorRotYawOffset`,
+       `actorRotPitchOffset`, `mobBodyYawOffset`, dan `mobHeadYawOffset` dengan
+       validasi perataan 4-byte (`offset % 4 == 0`) dan `std::isfinite`.
+     * Scoped Save & Restore: Sudut orientasi `LocalPlayer` dimodifikasi sesaat
+       sebelum memanggil `originalFn(...)` dan langsung dikembalikan ke nilai
+       semula tepat setelah `originalFn(...)` selesai pada frame yang sama,
+       sehingga kamera/arah pandang pemain di dunia Minecraft tidak pernah berubah.
+
+--------------------------------------------------------------------------------
+3. STATUS VERIFIKASI (KRITERIA KEBERHASILAN A, B, C)
+--------------------------------------------------------------------------------
+- STATUS A (Build):
+  * Di lingkungan container AI Studio ini: TIDAK DAPAT DIJALANKAN SECARA LOKAL
+    karena container tidak memiliki Android NDK (`ndk;28.2.13676358`), `cmake`,
+    maupun `clang++`. Kami tidak menyertakan file `.so` palsu atau hasil ganti
+    nama dari `libclange_me.so`.
+  * Siap dikompilasi di GitHub Actions menggunakan workflow `.github/workflows/build.yml`
+    yang mempertahankan konfigurasi NDK/CMake/PowerShell yang sudah terbukti
+    berhasil di repository pengguna.
+
+- STATUS B (Integrasi SDK & Target Minecraft 26.60):
+  * TERVERIFIKASI terhadap kontrak `LiteLDev/preloader-android` (`PL_REGISTER_MOD`,
+    `ll::mod::NativeMod::current()`, `pl::config::ConfigFile`, `pl::memory::hook`,
+    `pl::memory::resolveSignature`).
+  * BELUM TERVERIFIKASI SECARA BINER terhadap `libminecraftpe.so` 26.60 karena
+    file `libminecraftpe.so` dari APK Minecraft 26.60 tidak dilampirkan. Oleh
+    sebab itu, mod menyertakan pemindai simbol otomatis (`elfPhdrCallback` ->
+    `symbol_probe_26_60.json`) dan aplikasi web ini menyediakan alat pemindai
+    `libminecraftpe.so` berbasis browser (ELF64 AArch64 Scanner).
+
+- STATUS C (Runtime di Perangkat Android):
+  * BELUM DIUJI DI PERANGKAT FISIK (membutuhkan eksekusi di LeviLauncher Android
+    dengan Minecraft Bedrock 26.60 setelah artifact dibangun di GitHub Actions).

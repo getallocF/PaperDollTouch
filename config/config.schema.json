@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PaperDollTouch Config",
+  "description": "Configuration for PaperDollTouch inventory character touch rotation on Minecraft Bedrock 26.60 ARM64.",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "integer",
+      "title": "Config Version",
+      "readOnly": true,
+      "default": 1
+    },
+    "enabled": {
+      "type": "boolean",
+      "title": "Enabled",
+      "default": true
+    },
+    "sensitivityYaw": {
+      "type": "number",
+      "title": "Horizontal Yaw Sensitivity",
+      "default": 0.45
+    },
+    "sensitivityPitch": {
+      "type": "number",
+      "title": "Vertical Pitch Sensitivity",
+      "default": 0.3
+    },
+    "invertVertical": {
+      "type": "boolean",
+      "title": "Invert Vertical Drag",
+      "default": false
+    },
+    "maxPitchDegrees": {
+      "type": "number",
+      "title": "Max Pitch Degrees",
+      "default": 45.0
+    },
+    "resetOnInventoryClose": {
+      "type": "boolean",
+      "title": "Reset Orientation on Close",
+      "default": true
+    },
+    "smoothingFactor": {
+      "type": "number",
+      "title": "Smoothing Factor",
+      "default": 0.35
+    },
+    "boundsMinX": {
+      "type": "number",
+      "title": "Preview Bounds Min X",
+      "default": 0.24
+    },
+    "boundsMinY": {
+      "type": "number",
+      "title": "Preview Bounds Min Y",
+      "default": 0.14
+    },
+    "boundsMaxX": {
+      "type": "number",
+      "title": "Preview Bounds Max X",
+      "default": 0.44
+    },
+    "boundsMaxY": {
+      "type": "number",
+      "title": "Preview Bounds Max Y",
+      "default": 0.56
+    },
+    "expectedMinecraftVersion": {
+      "type": "string",
+      "title": "Expected Minecraft Version",
+      "default": "26.60"
+    },
+    "allowSymbolAutoProbe": {
+      "type": "boolean",
+      "title": "Allow ELF Symbol Auto-Probe",
+      "default": true
+    },
+    "allowNativeInputQueueFallback": {
+      "type": "boolean",
+      "title": "Allow AInputQueue Fallback",
+      "default": true
+    },
+    "verifiedSignaturesReady": {
+      "type": "boolean",
+      "title": "Verified Signatures Ready",
+      "default": false
+    },
+    "hudPlayerRendererRenderSig": {
+      "type": "string",
+      "title": "HudPlayerRenderer::render Signature",
+      "default": ""
+    },
+    "getLocalPlayerFromClientSig": {
+      "type": "string",
+      "title": "ClientInstance::getLocalPlayer Signature",
+      "default": ""
+    },
+    "actorGetRotationSig": {
+      "type": "string",
+      "title": "Actor::getRotation Signature",
+      "default": ""
+    },
+    "actorRotYawOffset": {
+      "type": "integer",
+      "title": "Actor Yaw Offset",
+      "default": 0
+    },
+    "actorRotPitchOffset": {
+      "type": "integer",
+      "title": "Actor Pitch Offset",
+      "default": 0
+    },
+    "mobBodyYawOffset": {
+      "type": "integer",
+      "title": "Mob Body Yaw Offset",
+      "default": 0
+    },
+    "mobHeadYawOffset": {
+      "type": "integer",
+      "title": "Mob Head Yaw Offset",
+      "default": 0
+    }
+  },
+  "required": [
+    "version",
+    "enabled",
+    "sensitivityYaw",
+    "sensitivityPitch",
+    "invertVertical",
+    "maxPitchDegrees",
+    "resetOnInventoryClose",
+    "smoothingFactor",
+    "boundsMinX",
+    "boundsMinY",
+    "boundsMaxX",
+    "boundsMaxY",
+    "expectedMinecraftVersion",
+    "allowSymbolAutoProbe",
+    "allowNativeInputQueueFallback",
+    "verifiedSignaturesReady",
+    "hudPlayerRendererRenderSig",
+    "getLocalPlayerFromClientSig",
+    "actorGetRotationSig",
+    "actorRotYawOffset",
+    "actorRotPitchOffset",
+    "mobBodyYawOffset",
+    "mobHeadYawOffset"
+  ]
+}

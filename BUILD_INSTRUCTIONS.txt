@@ -1,0 +1,85 @@
+================================================================================
+PANDUAN BUILD & INSTALASI PAPERDOLLTOUCH DARI HP ANDROID (TANPA PC)
+Target: LeviLauncher Android — Minecraft Bedrock 26.60 (arm64-v8a)
+================================================================================
+
+PENTING — STATUS KEJUJURAN TEKNIS (SESUAI KRITERIA A, B, C):
+1. File "PaperDollTouch_Source.zip" ini telah menggabungkan sistem build template
+   LeviLauncher yang sudah terbukti hijau di GitHub Actions milikmu dengan
+   implementasi C++20 PaperDollTouch yang sesungguhnya (tanpa sisa kode contoh
+   "Clange Me Mod" / "libclange_me.so" / "Hello from clange_me").
+2. Lingkungan server AI Studio tidak memiliki Android NDK (ndk;28.2.13676358)
+   dan tidak memiliki file APK/libminecraftpe.so Minecraft 26.60. Sesuai
+   instruksi, kami TIDAK membuat file .so/.levipack palsu atau sekadar mengganti
+   nama libclange_me.so menjadi libPaperDollTouch.so.
+3. Kamu hanya perlu menjalankan ulang workflow GitHub Actions dari ZIP ini untuk
+   menghasilkan "PaperDollTouch.levipack" dan "libPaperDollTouch.so" asli yang
+   dikompilasi dari source PaperDollTouch.
+
+--------------------------------------------------------------------------------
+LANGKAH 1: KOMPILASI DI GITHUB ACTIONS DARI HP ANDROID
+--------------------------------------------------------------------------------
+Karena kamu sudah memiliki repository GitHub yang berhasil menjalankan Actions:
+
+CARA A (Paling Mudah Lewat Termux di HP):
+1. Unduh "PaperDollTouch_Source.zip" dari halaman aplikasi ini (tersedia di
+   folder Download HP).
+2. Buka Termux, lalu jalankan perintah berikut satu per satu:
+   cd ~/PaperDollTouch
+   rm -rf * .github .clang-format .gitattributes .gitignore
+   unzip -o ~/storage/downloads/PaperDollTouch_Source.zip
+   git add -A
+   git commit -m "Implement real PaperDollTouch native mod on working template"
+   git push origin main
+
+CARA B (Tanpa Termux — Langsung Lewat Browser Chrome di HP):
+1. Ekstrak "PaperDollTouch_Source.zip" menggunakan aplikasi File Manager di HP.
+2. Buka repository GitHub kamu di Chrome -> tekan "Add file" -> "Upload files".
+3. Pilih semua file hasil ekstraksi (`CMakeLists.txt`, `manifest.json.in`,
+   folder `src`, `scripts`, `config`, dan `.github/workflows/build.yml`), lalu
+   tekan "Commit changes".
+
+--------------------------------------------------------------------------------
+LANGKAH 2: UNDUH ARTIFACT HASIL BUILD DARI GITHUB ACTIONS
+--------------------------------------------------------------------------------
+1. Buka tab "Actions" di repository GitHub kamu.
+2. Klik workflow "Build PaperDollTouch" yang sedang berjalan (atau tekan
+   "Run workflow").
+3. Setelah centang hijau, gulir ke bagian "Artifacts" di bawah halaman dan unduh
+   artifact bernama "PaperDollTouch".
+4. Ekstrak ZIP artifact tersebut di HP. Di dalamnya terdapat:
+   - PaperDollTouch.levipack           (Paket siap impor ke LeviLauncher)
+   - PaperDollTouch-1.0.0-arm64-v8a.levipack
+   - libPaperDollTouch.so              (Binary ELF64 ARM64 terpisah)
+   - manifest.json                     (Manifest preload-native)
+   - ELF_VERIFICATION.txt              (Bukti readelf & symbol check dari CI)
+
+--------------------------------------------------------------------------------
+LANGKAH 3: INSTALASI DI LEVILAUNCHER ANDROID
+--------------------------------------------------------------------------------
+1. Buka aplikasi LeviLauncher di HP Android kamu.
+2. Masuk ke menu Mods / Native Mods untuk profil Minecraft Bedrock 26.60.
+3. Pilih "Import" / "Add Mod", lalu pilih file "PaperDollTouch.levipack".
+4. Pastikan mod "PaperDollTouch" berstatus Enabled (Aktif).
+5. Jalankan Minecraft Bedrock 26.60 melalui LeviLauncher.
+
+--------------------------------------------------------------------------------
+LANGKAH 4: VERIFIKASI SYMBOL / SIGNATURE MINECRAFT 26.60 DI HP
+--------------------------------------------------------------------------------
+Saat game dijalankan pertama kali:
+1. PaperDollTouch secara otomatis menjalankan pemindaian satu-kali (one-time
+   read-only ELF64 .dynsym probe) terhadap `libminecraftpe.so` di memori untuk
+   mencari simbol:
+   - `HudPlayerRenderer::render`
+   - `ClientInstance::getLocalPlayer`
+   - `Actor::getRotation` (akses orientasi bebas-offset!)
+2. Hasil pemindaian ditulis secara otomatis ke file:
+   `<Folder_Data_Mod_LeviLauncher>/PaperDollTouch/symbol_probe_26_60.json`
+3. Jika binary `libminecraftpe.so` pada Minecraft 26.60 mengekspor simbol-simbol
+   tersebut, hook langsung aktif secara otomatis (`hookInstalled: true`) dan kamu
+   bisa langsung memutar karakter di layar inventory!
+4. Jika `libminecraftpe.so` pada build 26.60 milikmu di-strip (simbol dihapus):
+   - Buka tab "ELF 26.60 Scanner" di aplikasi web ini dari HP kamu.
+   - Pilih file `libminecraftpe.so` (dari APK Minecraft 26.60) untuk memindai
+     pola instruksi AArch64 dan menghasilkan `config.json` yang terisi otomatis,
+     atau salin hasil `symbol_probe_26_60.json` untuk inspeksi lebih lanjut.
