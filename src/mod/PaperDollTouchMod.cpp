@@ -7,9 +7,7 @@
 #include <cstring>
 #include <ctime>
 #include <dlfcn.h>
-#include <elf.h>
 #include <fstream>
-#include <link.h>
 #include <string_view>
 
 #include <android/input.h>
@@ -29,6 +27,13 @@
 #define PDT_HAS_PL_HOOK 0
 #endif
 
+#if __has_include(<pl/memory/Vtable.hpp>)
+#include <pl/memory/Vtable.hpp>
+#define PDT_HAS_PL_VTABLE 1
+#else
+#define PDT_HAS_PL_VTABLE 0
+#endif
+
 #if __has_include(<pl/memory/Signature.hpp>)
 #include <pl/memory/Signature.hpp>
 #define PDT_HAS_PL_SIG 1
@@ -43,194 +48,108 @@ namespace paperdoll {
 
 namespace {
 
-// AArch64 AAPCS64 function pointer types for Minecraft Bedrock internal methods
-using HudPlayerRendererRenderFn = void (*)(
+// AArch64 AAPCS64 function pointer types for Minecraft Bedrock 26.60 virtual methods
+using UICustomRendererRenderFn = void (*)(
     void *self,
     void *renderContext,
     void *clientInstance,
     void *uiControl,
-    int pass,
-    McRectangleArea *rectArea
+    int pass
 );
 
-using GetLocalPlayerFn = void *(*)(void *clientInstance);
-using ActorGetRotationFn = const McVec2 *(*)(const void *actor);
-using ActorGetYHeadRotFn = float (*)(const void *actor);
-using ActorSetYHeadRotFn = void (*)(void *actor, float yaw);
+using PaperDollRenderGuiFn = void (*)(
+    void *self,
+    const void *rendererName,
+    McActorRenderDataPrefix *actorRenderData,
+    const void *captureDesc
+);
+
+using DataDrivenRenderFn = void (*)(
+    void *self,
+    void *baseActorRenderContext,
+    McActorRenderDataPrefix *actorRenderData
+);
+
+using MobGetInterpolatedRotFn = float (*)(const void *self, float partialTicks);
 using AInputQueueGetEventFn = int32_t (*)(void *queue, void **outEvent);
 
-// Timeout (ms) since last HudPlayerRenderer::render call to consider the inventory screen open
-constexpr std::int64_t kInventoryRenderTimeoutMs = 160;
+// Timeout (ms) since last LivePlayerRenderer / PaperDollRenderer render call to consider Inventory open
+constexpr std::int64_t kInventoryRenderTimeoutMs = 220;
 
-// Minimum UI control dimensions to distinguish Inventory Paper Doll from top-left HUD Paper Doll
-constexpr float kMinInventoryPreviewWidthUi = 28.0f;
-constexpr float kMinInventoryPreviewHeightUi = 40.0f;
-
-// Known Itanium C++ ABI mangled symbol candidates in libminecraftpe.so (ARM64)
-constexpr std::array<std::string_view, 4> kHudPlayerRenderSymbolCandidates = {
-    "_ZN17HudPlayerRenderer6renderER24MinecraftUIRenderContextR15IClientInstanceR9UIControliR13RectangleArea",
-    "_ZN17HudPlayerRenderer6renderER24MinecraftUIRenderContextR14ClientInstanceR9UIControliR13RectangleArea",
-    "_ZN17HudPlayerRenderer6renderER24MinecraftUIRenderContextR15IClientInstanceR9UIControliRN3mce13RectangleAreaE",
-    "_ZN17HudPlayerRenderer6renderEP24MinecraftUIRenderContextP15IClientInstanceP9UIControliP13RectangleArea"
-};
-
-constexpr std::array<std::string_view, 4> kGetLocalPlayerSymbolCandidates = {
-    "_ZNK14ClientInstance14getLocalPlayerEv",
-    "_ZN14ClientInstance14getLocalPlayerEv",
-    "_ZNK15IClientInstance14getLocalPlayerEv",
-    "_ZN15IClientInstance14getLocalPlayerEv"
-};
-
-constexpr std::array<std::string_view, 2> kActorGetRotationSymbolCandidates = {
-    "_ZNK5Actor11getRotationEv",
-    "_ZN5Actor11getRotationEv"
-};
-
-// One-time read-only ELF64 .dynsym probe via dl_iterate_phdr for libminecraftpe.so
-struct ElfProbeResult {
-    std::uintptr_t baseAddr{0};
-    std::uintptr_t hudRenderAddr{0};
-    std::string hudRenderSym{};
-    std::uintptr_t getLocalPlayerAddr{0};
-    std::string getLocalPlayerSym{};
-    std::uintptr_t actorGetRotAddr{0};
-    std::string actorGetRotSym{};
-    std::uintptr_t actorGetHeadRotAddr{0};
-    std::uintptr_t actorSetHeadRotAddr{0};
-    std::size_t scannedDynamicSymbols{0};
-};
-
-int elfPhdrCallback(struct dl_phdr_info *info, size_t /*size*/, void *data) noexcept {
-    if (!info || !info->dlpi_name || !data)
-        return 0;
-
-    std::string_view modName(info->dlpi_name);
-    if (modName.find("libminecraftpe.so") == std::string_view::npos)
-        return 0;
-
-    auto *result = static_cast<ElfProbeResult *>(data);
-    result->baseAddr = static_cast<std::uintptr_t>(info->dlpi_addr);
-
-    const Elf64_Dyn *dyn = nullptr;
-    for (int i = 0; i < info->dlpi_phnum; ++i) {
-        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
-            dyn = reinterpret_cast<const Elf64_Dyn *>(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
-            break;
-        }
-    }
-    if (!dyn)
-        return 1;
-
-    const Elf64_Sym *symtab = nullptr;
-    const char *strtab = nullptr;
-    std::size_t strsz = 0;
-    const std::uint32_t *sysvHash = nullptr;
-    const std::uint32_t *gnuHash = nullptr;
-
-    for (const Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; ++d) {
-        switch (d->d_tag) {
-        case DT_SYMTAB:
-            symtab = reinterpret_cast<const Elf64_Sym *>(
-                d->d_un.d_ptr > info->dlpi_addr ? d->d_un.d_ptr : (info->dlpi_addr + d->d_un.d_ptr));
-            break;
-        case DT_STRTAB:
-            strtab = reinterpret_cast<const char *>(
-                d->d_un.d_ptr > info->dlpi_addr ? d->d_un.d_ptr : (info->dlpi_addr + d->d_un.d_ptr));
-            break;
-        case DT_STRSZ:
-            strsz = static_cast<std::size_t>(d->d_un.d_val);
-            break;
-        case DT_HASH:
-            sysvHash = reinterpret_cast<const std::uint32_t *>(
-                d->d_un.d_ptr > info->dlpi_addr ? d->d_un.d_ptr : (info->dlpi_addr + d->d_un.d_ptr));
-            break;
-        case DT_GNU_HASH:
-            gnuHash = reinterpret_cast<const std::uint32_t *>(
-                d->d_un.d_ptr > info->dlpi_addr ? d->d_un.d_ptr : (info->dlpi_addr + d->d_un.d_ptr));
-            break;
-        default:
-            break;
-        }
-    }
-
-    if (!symtab || !strtab || strsz == 0)
-        return 1;
-
-    std::size_t symCount = 0;
-    if (sysvHash) {
-        symCount = sysvHash[1]; // nchain
-    } else if (gnuHash) {
-        const std::uint32_t nbuckets = gnuHash[0];
-        const std::uint32_t symoffset = gnuHash[1];
-        const std::uint32_t bloomSize = gnuHash[2];
-        const auto *bloom = reinterpret_cast<const std::uint64_t *>(&gnuHash[4]);
-        const auto *buckets = reinterpret_cast<const std::uint32_t *>(&bloom[bloomSize]);
-        const auto *chain = &buckets[nbuckets];
-
-        std::uint32_t maxSym = symoffset;
-        for (std::uint32_t b = 0; b < nbuckets; ++b) {
-            if (buckets[b] > maxSym)
-                maxSym = buckets[b];
-        }
-        if (maxSym >= symoffset) {
-            while ((chain[maxSym - symoffset] & 1U) == 0U) {
-                ++maxSym;
-            }
-            symCount = static_cast<std::size_t>(maxSym) + 1U;
-        }
-    }
-
-    result->scannedDynamicSymbols = symCount;
-    for (std::size_t idx = 1; idx < symCount; ++idx) {
-        const Elf64_Sym &sym = symtab[idx];
-        if (sym.st_value == 0 || sym.st_name == 0 || sym.st_name >= strsz)
-            continue;
-
-        std::string_view sname(strtab + sym.st_name);
-        const std::uintptr_t resolvedAddr = info->dlpi_addr + sym.st_value;
-
-        if (result->hudRenderAddr == 0 &&
-            sname.find("HudPlayerRenderer") != std::string_view::npos &&
-            sname.find("render") != std::string_view::npos) {
-            result->hudRenderAddr = resolvedAddr;
-            result->hudRenderSym = std::string(sname);
-        } else if (result->getLocalPlayerAddr == 0 &&
-                   (sname.find("ClientInstance") != std::string_view::npos) &&
-                   (sname.find("getLocalPlayer") != std::string_view::npos)) {
-            result->getLocalPlayerAddr = resolvedAddr;
-            result->getLocalPlayerSym = std::string(sname);
-        } else if (result->actorGetRotAddr == 0 && sname == "_ZNK5Actor11getRotationEv") {
-            result->actorGetRotAddr = resolvedAddr;
-            result->actorGetRotSym = std::string(sname);
-        } else if (result->actorGetHeadRotAddr == 0 && sname == "_ZNK5Actor11getYHeadRotEv") {
-            result->actorGetHeadRotAddr = resolvedAddr;
-        } else if (result->actorSetHeadRotAddr == 0 && sname == "_ZN5Actor11setYHeadRotEf") {
-            result->actorSetHeadRotAddr = resolvedAddr;
-        }
-    }
-
-    return 1;
+bool isValidRotationFloat(float val) noexcept {
+    return std::isfinite(val) && std::fabs(val) <= 36000.0f;
 }
 
-void detourHudPlayerRendererRender(
+// Scoped RAII guard for inInventoryRenderPass flag
+struct ScopedInventoryPass {
+    std::atomic<bool> &flag;
+    explicit ScopedInventoryPass(std::atomic<bool> &f) noexcept : flag(f) {
+        flag.store(true, std::memory_order_release);
+    }
+    ~ScopedInventoryPass() noexcept {
+        flag.store(false, std::memory_order_release);
+    }
+};
+
+void detourLivePlayerRendererRender(
     void *self,
     void *renderContext,
     void *clientInstance,
     void *uiControl,
-    int pass,
-    McRectangleArea *rectArea
+    int pass
 ) noexcept {
-    PaperDollTouchMod::instance().onHudPlayerRenderDetour(
-        self, renderContext, clientInstance, uiControl, pass, rectArea
+    PaperDollTouchMod::instance().onLivePlayerRenderDetour(
+        self, renderContext, clientInstance, uiControl, pass
     );
+}
+
+void detourPaperDollRendererRender(
+    void *self,
+    void *renderContext,
+    void *clientInstance,
+    void *uiControl,
+    int pass
+) noexcept {
+    PaperDollTouchMod::instance().onPaperDollRenderDetour(
+        self, renderContext, clientInstance, uiControl, pass
+    );
+}
+
+void detourPaperDollRenderGui(
+    void *self,
+    const void *rendererName,
+    McActorRenderDataPrefix *actorRenderData,
+    const void *captureDesc
+) noexcept {
+    PaperDollTouchMod::instance().onPaperDollRenderGuiDetour(
+        self, rendererName, actorRenderData, captureDesc
+    );
+}
+
+void detourDataDrivenRendererRender(
+    void *self,
+    void *baseActorRenderContext,
+    McActorRenderDataPrefix *actorRenderData
+) noexcept {
+    PaperDollTouchMod::instance().onDataDrivenRenderDetour(
+        self, baseActorRenderContext, actorRenderData
+    );
+}
+
+float detourMobGetInterpolatedBodyRot(const void *self, float partialTicks) noexcept {
+    return PaperDollTouchMod::instance().onMobGetInterpolatedBodyRotDetour(self, partialTicks);
+}
+
+float detourMobGetInterpolatedHeadRot(const void *self, float partialTicks) noexcept {
+    return PaperDollTouchMod::instance().onMobGetInterpolatedHeadRotDetour(self, partialTicks);
+}
+
+float detourMobGetInterpolatedBodyYaw(const void *self, float partialTicks) noexcept {
+    return PaperDollTouchMod::instance().onMobGetInterpolatedBodyYawDetour(self, partialTicks);
 }
 
 int32_t detourAInputQueueGetEvent(void *queue, void **outEvent) noexcept {
     return PaperDollTouchMod::instance().onInputQueueGetEventDetour(queue, outEvent);
-}
-
-bool isValidRotationFloat(float val) noexcept {
-    return std::isfinite(val) && std::fabs(val) <= 36000.0f;
 }
 
 } // namespace
@@ -250,6 +169,18 @@ std::int64_t PaperDollTouchMod::monotonicMillis() noexcept {
 }
 
 void PaperDollTouchMod::sanitizeAndApplyConfig() noexcept {
+    // Automatically migrate narrow v1 hit-box bounds to v2 full-inventory character bounds
+    if (mConfig.version < 2 ||
+        (mConfig.boundsMinX >= 0.20f && mConfig.boundsMaxX <= 0.46f)) {
+        mConfig.version = 2;
+        mConfig.boundsMinX = 0.04f;
+        mConfig.boundsMinY = 0.06f;
+        mConfig.boundsMaxX = 0.68f;
+        mConfig.boundsMaxY = 0.82f;
+        if (mConfig.sensitivityYaw < 0.50f)
+            mConfig.sensitivityYaw = 0.55f;
+    }
+
     mConfig.sensitivityYaw = std::clamp(mConfig.sensitivityYaw, 0.05f, 5.0f);
     mConfig.sensitivityPitch = std::clamp(mConfig.sensitivityPitch, 0.0f, 5.0f);
     mConfig.maxPitchDegrees = std::clamp(mConfig.maxPitchDegrees, 0.0f, 85.0f);
@@ -268,7 +199,7 @@ void PaperDollTouchMod::sanitizeAndApplyConfig() noexcept {
 
 bool PaperDollTouchMod::load() {
     auto &self = getSelf();
-    self.getLogger().info("Loading PaperDollTouch v1.0.0 for Minecraft Bedrock {} (arm64-v8a)...",
+    self.getLogger().info("Loading PaperDollTouch v1.1.0 (RTTI Vtable Engine) for Minecraft Bedrock {} (arm64-v8a)...",
                           mConfig.expectedMinecraftVersion);
 
     std::error_code ec;
@@ -302,9 +233,10 @@ bool PaperDollTouchMod::load() {
 
 void PaperDollTouchMod::writeDiagnosticProbeReport(
     bool hookReady,
-    const std::string &renderSymSource,
-    const std::string &localPlayerSymSource,
-    const std::string &rotationAccessMode
+    const std::string &liveRenderSource,
+    const std::string &paperDollSource,
+    const std::string &dataDrivenSource,
+    const std::string &mobInterpSource
 ) const noexcept {
     std::error_code ec;
     const auto reportPath = getSelf().getDataDir() / "symbol_probe_26_60.json";
@@ -314,16 +246,19 @@ void PaperDollTouchMod::writeDiagnosticProbeReport(
 
     nlohmann::json report = {
         {"mod", "PaperDollTouch"},
-        {"version", "1.0.0"},
+        {"version", "1.1.0"},
         {"targetMinecraftVersion", mConfig.expectedMinecraftVersion},
         {"hookInstalled", hookReady},
-        {"hudPlayerRendererRenderResolved", mHudPlayerRenderTarget != nullptr},
-        {"hudPlayerRendererRenderSource", renderSymSource},
-        {"getLocalPlayerResolved", mGetLocalPlayerFn != nullptr},
-        {"getLocalPlayerSource", localPlayerSymSource},
-        {"actorGetRotationResolved", mActorGetRotationFn != nullptr},
-        {"rotationAccessMode", rotationAccessMode},
-        {"inputHandlerReady", mPlInputCallbackRegistered || mInputQueueHookInstalled}
+        {"livePlayerRendererResolved", mLivePlayerRenderTarget != nullptr},
+        {"livePlayerRendererSource", liveRenderSource},
+        {"paperDollRendererResolved", mPaperDollRenderTarget != nullptr},
+        {"paperDollRendererSource", paperDollSource},
+        {"dataDrivenRendererResolved", mDataDrivenRenderTarget != nullptr},
+        {"dataDrivenRendererSource", dataDrivenSource},
+        {"mobInterpolatedRotResolved", mMobBodyRotTarget != nullptr},
+        {"mobInterpolatedRotSource", mobInterpSource},
+        {"plInputRegistered", mPlInputCallbackRegistered},
+        {"inputQueueHookInstalled", mInputQueueHookInstalled}
     };
     out << report.dump(2) << '\n';
 }
@@ -331,145 +266,224 @@ void PaperDollTouchMod::writeDiagnosticProbeReport(
 bool PaperDollTouchMod::tryResolveAndInstallHooks() noexcept {
     auto &logger = getSelf().getLogger();
 
-    std::uintptr_t renderAddr = 0;
-    std::uintptr_t getLocalPlayerAddr = 0;
-    std::uintptr_t actorGetRotAddr = 0;
-    std::string renderSource = "unresolved";
-    std::string localPlayerSource = "unresolved";
+    std::uintptr_t liveRenderAddr = 0;
+    std::uintptr_t paperDollRenderAddr = 0;
+    std::uintptr_t paperDollRenderGuiAddr = 0;
+    std::uintptr_t dataDrivenRenderAddr = 0;
+    std::uintptr_t mobBodyRotAddr = 0;
+    std::uintptr_t mobHeadRotAddr = 0;
+    std::uintptr_t mobBodyYawAddr = 0;
+
+    std::string liveSource = "unresolved";
+    std::string paperDollSource = "unresolved";
+    std::string dataDrivenSource = "unresolved";
+    std::string mobInterpSource = "unresolved";
 
 #if PDT_HAS_PL_SIG
-    // 1. User-configured signature or symbol in config.json takes highest precedence
     if (!mConfig.hudPlayerRendererRenderSig.empty()) {
-        renderAddr = pl::memory::resolveSignature(mConfig.hudPlayerRendererRenderSig, "libminecraftpe.so");
-        if (renderAddr != 0) {
-            renderSource = "config:hudPlayerRendererRenderSig";
-        }
-    }
-    if (!mConfig.getLocalPlayerFromClientSig.empty()) {
-        getLocalPlayerAddr = pl::memory::resolveSignature(mConfig.getLocalPlayerFromClientSig, "libminecraftpe.so");
-        if (getLocalPlayerAddr != 0) {
-            localPlayerSource = "config:getLocalPlayerFromClientSig";
-        }
-    }
-    if (!mConfig.actorGetRotationSig.empty()) {
-        actorGetRotAddr = pl::memory::resolveSignature(mConfig.actorGetRotationSig, "libminecraftpe.so");
-    }
-
-    // 2. Auto-probe known Bedrock ARM64 mangled symbol candidates via pl::memory::resolveSignature
-    if (mConfig.allowSymbolAutoProbe) {
-        if (renderAddr == 0) {
-            for (const auto &sym : kHudPlayerRenderSymbolCandidates) {
-                renderAddr = pl::memory::resolveSignature(sym, "libminecraftpe.so");
-                if (renderAddr != 0) {
-                    renderSource = std::string("pl::resolveSignature:") + std::string(sym);
-                    break;
-                }
-            }
-        }
-        if (getLocalPlayerAddr == 0) {
-            for (const auto &sym : kGetLocalPlayerSymbolCandidates) {
-                getLocalPlayerAddr = pl::memory::resolveSignature(sym, "libminecraftpe.so");
-                if (getLocalPlayerAddr != 0) {
-                    localPlayerSource = std::string("pl::resolveSignature:") + std::string(sym);
-                    break;
-                }
-            }
-        }
-        if (actorGetRotAddr == 0) {
-            for (const auto &sym : kActorGetRotationSymbolCandidates) {
-                actorGetRotAddr = pl::memory::resolveSignature(sym, "libminecraftpe.so");
-                if (actorGetRotAddr != 0)
-                    break;
-            }
+        liveRenderAddr = pl::memory::resolveSignature(mConfig.hudPlayerRendererRenderSig, "libminecraftpe.so");
+        if (liveRenderAddr != 0) {
+            liveSource = "config:hudPlayerRendererRenderSig";
         }
     }
 #endif
 
-    // 3. One-time read-only ELF64 .dynsym scan via dl_iterate_phdr
-    if (mConfig.allowSymbolAutoProbe && (renderAddr == 0 || getLocalPlayerAddr == 0 || actorGetRotAddr == 0)) {
-        ElfProbeResult probe{};
-        dl_iterate_phdr(&elfPhdrCallback, &probe);
-        if (renderAddr == 0 && probe.hudRenderAddr != 0) {
-            renderAddr = probe.hudRenderAddr;
-            renderSource = "elf_dynsym:" + probe.hudRenderSym;
+#if PDT_HAS_PL_VTABLE
+    if (mConfig.allowSymbolAutoProbe) {
+        // 1. Resolve LivePlayerRenderer::render and PaperDollRenderer::render via RTTI Vtable
+        // Default slot in MinecraftUICustomRenderer is 17; scan 17 first, then fallback 14..22
+        constexpr std::array<std::size_t, 9> kUiRenderSlotOrder = {17, 16, 18, 15, 19, 14, 20, 21, 22};
+        for (std::size_t slot : kUiRenderSlotOrder) {
+            const std::uintptr_t candLive = pl::memory::resolveVtableFunction("18LivePlayerRenderer", slot);
+            const std::uintptr_t candHud = pl::memory::resolveVtableFunction("17HudPlayerRenderer", slot);
+            const std::uintptr_t candPaper = pl::memory::resolveVtableFunction("17PaperDollRenderer", slot);
+            const std::uintptr_t candBase = pl::memory::resolveVtableFunction("25MinecraftUICustomRenderer", slot);
+
+            if (candLive != 0 && candHud != 0 && candLive != candHud && candLive != candBase) {
+                if (liveRenderAddr == 0) {
+                    liveRenderAddr = candLive;
+                    liveSource = "vtable:18LivePlayerRenderer#" + std::to_string(slot);
+                }
+                if (paperDollRenderAddr == 0 && candPaper != 0 && candPaper != candHud && candPaper != candBase) {
+                    paperDollRenderAddr = candPaper;
+                    paperDollSource = "vtable:17PaperDollRenderer#" + std::to_string(slot);
+                }
+                break;
+            }
         }
-        if (getLocalPlayerAddr == 0 && probe.getLocalPlayerAddr != 0) {
-            getLocalPlayerAddr = probe.getLocalPlayerAddr;
-            localPlayerSource = "elf_dynsym:" + probe.getLocalPlayerSym;
+
+        // Fallback if 17HudPlayerRenderer RTTI was optimized out
+        if (liveRenderAddr == 0) {
+            liveRenderAddr = pl::memory::resolveVtableFunction("18LivePlayerRenderer", 17);
+            if (liveRenderAddr != 0)
+                liveSource = "vtable:18LivePlayerRenderer#17";
         }
-        if (actorGetRotAddr == 0 && probe.actorGetRotAddr != 0) {
-            actorGetRotAddr = probe.actorGetRotAddr;
+        if (paperDollRenderAddr == 0) {
+            paperDollRenderAddr = pl::memory::resolveVtableFunction("17PaperDollRenderer", 17);
+            if (paperDollRenderAddr != 0)
+                paperDollSource = "vtable:17PaperDollRenderer#17";
         }
-        if (probe.actorGetHeadRotAddr != 0) {
-            mActorGetYHeadRotFn = reinterpret_cast<void *>(probe.actorGetHeadRotAddr);
+
+        // 2. Resolve PaperDollBaseActorRenderContext::renderGui (slot 6)
+        paperDollRenderGuiAddr = pl::memory::resolveVtableFunction("31PaperDollBaseActorRenderContext", 6);
+
+        // 3. Resolve DataDrivenRenderer::render(BaseActorRenderContext&, ActorRenderData&) (slot 3)
+        constexpr std::array<std::size_t, 5> kDataDrivenSlotOrder = {3, 2, 4, 5, 6};
+        for (std::size_t slot : kDataDrivenSlotOrder) {
+            const std::uintptr_t candDd = pl::memory::resolveVtableFunction("18DataDrivenRenderer", slot);
+            const std::uintptr_t candBase = pl::memory::resolveVtableFunction("13ActorRenderer", slot);
+            if (candDd != 0 && candDd != candBase) {
+                dataDrivenRenderAddr = candDd;
+                dataDrivenSource = "vtable:18DataDrivenRenderer#" + std::to_string(slot);
+                break;
+            }
         }
-        if (probe.actorSetHeadRotAddr != 0) {
-            mActorSetYHeadRotFn = reinterpret_cast<void *>(probe.actorSetHeadRotAddr);
+        if (dataDrivenRenderAddr == 0) {
+            dataDrivenRenderAddr = pl::memory::resolveVtableFunction("18DataDrivenRenderer", 3);
+            if (dataDrivenRenderAddr != 0)
+                dataDrivenSource = "vtable:18DataDrivenRenderer#3";
+        }
+
+        // 4. Resolve Mob::getInterpolatedBodyRot (slot 14), getInterpolatedHeadRot (slot 15), getInterpolatedBodyYaw (slot 16)
+        // Verify against 5Actor where slots 12,13 are identical and 14,15,16 are overridden by 3Mob
+        bool foundMobSlots = false;
+        for (std::size_t baseSlot : {14ULL, 13ULL, 15ULL, 12ULL, 16ULL, 17ULL}) {
+            const std::uintptr_t m0 = pl::memory::resolveVtableFunction("3Mob", baseSlot);
+            const std::uintptr_t m1 = pl::memory::resolveVtableFunction("3Mob", baseSlot + 1);
+            const std::uintptr_t m2 = pl::memory::resolveVtableFunction("3Mob", baseSlot + 2);
+            const std::uintptr_t a0 = pl::memory::resolveVtableFunction("5Actor", baseSlot);
+            const std::uintptr_t a1 = pl::memory::resolveVtableFunction("5Actor", baseSlot + 1);
+            const std::uintptr_t a2 = pl::memory::resolveVtableFunction("5Actor", baseSlot + 2);
+            const std::uintptr_t prevM = baseSlot > 0 ? pl::memory::resolveVtableFunction("3Mob", baseSlot - 1) : 0;
+            const std::uintptr_t prevA = baseSlot > 0 ? pl::memory::resolveVtableFunction("5Actor", baseSlot - 1) : 0;
+
+            if (m0 != 0 && m1 != 0 && m2 != 0 &&
+                a0 != 0 && a1 != 0 && a2 != 0 &&
+                m0 != a0 && m1 != a1 && m2 != a2 &&
+                (prevM == prevA)) {
+                mobBodyRotAddr = m0;
+                mobHeadRotAddr = m1;
+                mobBodyYawAddr = m2;
+                mobInterpSource = "vtable:3Mob#" + std::to_string(baseSlot) + ".." + std::to_string(baseSlot + 2);
+                foundMobSlots = true;
+                break;
+            }
+        }
+        if (!foundMobSlots) {
+            mobBodyRotAddr = pl::memory::resolveVtableFunction("3Mob", 14);
+            mobHeadRotAddr = pl::memory::resolveVtableFunction("3Mob", 15);
+            mobBodyYawAddr = pl::memory::resolveVtableFunction("3Mob", 16);
+            if (mobBodyRotAddr != 0)
+                mobInterpSource = "vtable:3Mob#14..16";
         }
     }
-
-    const bool hasValidStructOffsets =
-        mConfig.verifiedSignaturesReady &&
-        mConfig.actorRotYawOffset > 0 &&
-        mConfig.actorRotPitchOffset > 0 &&
-        (mConfig.actorRotYawOffset % 4 == 0) &&
-        (mConfig.actorRotPitchOffset % 4 == 0);
-
-    const bool hasRotationAccess = (actorGetRotAddr != 0) || hasValidStructOffsets;
-    std::string rotationMode = "none (awaiting Actor::getRotation symbol or verified offsets)";
-    if (actorGetRotAddr != 0) {
-        rotationMode = "symbol:Actor::getRotation()";
-    } else if (hasValidStructOffsets) {
-        rotationMode = "offsets:verified_actor_float_offsets";
-    }
-
-    if (renderAddr == 0 || getLocalPlayerAddr == 0 || !hasRotationAccess) {
-        logger.warn(
-            "[PaperDollTouch] Hook prerequisites incomplete for Minecraft {} "
-            "(HudPlayerRenderer::render={}, getLocalPlayer={}, rotationAccess={}). "
-            "Staying in fail-safe mode to prevent crash. Diagnostic saved to symbol_probe_26_60.json.",
-            mConfig.expectedMinecraftVersion,
-            renderSource,
-            localPlayerSource,
-            rotationMode
-        );
-        writeDiagnosticProbeReport(false, renderSource, localPlayerSource, rotationMode);
-        return false;
-    }
+#endif
 
 #if PDT_HAS_PL_HOOK
-    mHudPlayerRenderTarget = reinterpret_cast<void *>(renderAddr);
-    mGetLocalPlayerFn = reinterpret_cast<void *>(getLocalPlayerAddr);
-    mActorGetRotationFn = reinterpret_cast<void *>(actorGetRotAddr);
+    bool anyRendererHooked = false;
 
-    int status = pl::memory::hook(
-        mHudPlayerRenderTarget,
-        reinterpret_cast<void *>(&detourHudPlayerRendererRender),
-        &mHudPlayerRenderOriginal,
-        pl::memory::HookPriority::Normal
-    );
-
-    if (status != 0 || mHudPlayerRenderOriginal == nullptr) {
-        logger.error("[PaperDollTouch] pl::memory::hook failed for HudPlayerRenderer::render (status={})", status);
-        mHudPlayerRenderTarget = nullptr;
-        mHudPlayerRenderOriginal = nullptr;
-        mGetLocalPlayerFn = nullptr;
-        mActorGetRotationFn = nullptr;
-        writeDiagnosticProbeReport(false, renderSource, localPlayerSource, rotationMode);
-        return false;
+    if (liveRenderAddr != 0) {
+        mLivePlayerRenderTarget = reinterpret_cast<void *>(liveRenderAddr);
+        if (pl::memory::hook(
+                mLivePlayerRenderTarget,
+                reinterpret_cast<void *>(&detourLivePlayerRendererRender),
+                &mLivePlayerRenderOriginal,
+                pl::memory::HookPriority::Normal) == 0 &&
+            mLivePlayerRenderOriginal != nullptr) {
+            anyRendererHooked = true;
+            logger.info("[PaperDollTouch] Hooked LivePlayerRenderer::render ({})", liveSource);
+        } else {
+            mLivePlayerRenderTarget = nullptr;
+            mLivePlayerRenderOriginal = nullptr;
+        }
     }
 
-    mState.hookInstalled.store(true, std::memory_order_release);
-    logger.info(
-        "[PaperDollTouch] Installed HudPlayerRenderer::render hook ({}), getLocalPlayer ({}), rotation mode ({}).",
-        renderSource, localPlayerSource, rotationMode
-    );
-    writeDiagnosticProbeReport(true, renderSource, localPlayerSource, rotationMode);
-    return true;
-#else
-    writeDiagnosticProbeReport(false, renderSource, localPlayerSource, rotationMode);
-    return false;
+    if (paperDollRenderAddr != 0) {
+        mPaperDollRenderTarget = reinterpret_cast<void *>(paperDollRenderAddr);
+        if (pl::memory::hook(
+                mPaperDollRenderTarget,
+                reinterpret_cast<void *>(&detourPaperDollRendererRender),
+                &mPaperDollRenderOriginal,
+                pl::memory::HookPriority::Normal) == 0 &&
+            mPaperDollRenderOriginal != nullptr) {
+            anyRendererHooked = true;
+            logger.info("[PaperDollTouch] Hooked PaperDollRenderer::render ({})", paperDollSource);
+        } else {
+            mPaperDollRenderTarget = nullptr;
+            mPaperDollRenderOriginal = nullptr;
+        }
+    }
+
+    if (paperDollRenderGuiAddr != 0) {
+        mPaperDollRenderGuiTarget = reinterpret_cast<void *>(paperDollRenderGuiAddr);
+        if (pl::memory::hook(
+                mPaperDollRenderGuiTarget,
+                reinterpret_cast<void *>(&detourPaperDollRenderGui),
+                &mPaperDollRenderGuiOriginal,
+                pl::memory::HookPriority::Normal) != 0) {
+            mPaperDollRenderGuiTarget = nullptr;
+            mPaperDollRenderGuiOriginal = nullptr;
+        }
+    }
+
+    if (dataDrivenRenderAddr != 0) {
+        mDataDrivenRenderTarget = reinterpret_cast<void *>(dataDrivenRenderAddr);
+        if (pl::memory::hook(
+                mDataDrivenRenderTarget,
+                reinterpret_cast<void *>(&detourDataDrivenRendererRender),
+                &mDataDrivenRenderOriginal,
+                pl::memory::HookPriority::Normal) == 0 &&
+            mDataDrivenRenderOriginal != nullptr) {
+            logger.info("[PaperDollTouch] Hooked DataDrivenRenderer::render ({})", dataDrivenSource);
+        } else {
+            mDataDrivenRenderTarget = nullptr;
+            mDataDrivenRenderOriginal = nullptr;
+        }
+    }
+
+    if (mobBodyRotAddr != 0 && mobHeadRotAddr != 0 && mobBodyYawAddr != 0) {
+        mMobBodyRotTarget = reinterpret_cast<void *>(mobBodyRotAddr);
+        mMobHeadRotTarget = reinterpret_cast<void *>(mobHeadRotAddr);
+        mMobBodyYawTarget = reinterpret_cast<void *>(mobBodyYawAddr);
+
+        if (pl::memory::hook(
+                mMobBodyRotTarget,
+                reinterpret_cast<void *>(&detourMobGetInterpolatedBodyRot),
+                &mMobBodyRotOriginal,
+                pl::memory::HookPriority::Normal) != 0) {
+            mMobBodyRotTarget = nullptr;
+            mMobBodyRotOriginal = nullptr;
+        }
+        if (pl::memory::hook(
+                mMobHeadRotTarget,
+                reinterpret_cast<void *>(&detourMobGetInterpolatedHeadRot),
+                &mMobHeadRotOriginal,
+                pl::memory::HookPriority::Normal) != 0) {
+            mMobHeadRotTarget = nullptr;
+            mMobHeadRotOriginal = nullptr;
+        }
+        if (pl::memory::hook(
+                mMobBodyYawTarget,
+                reinterpret_cast<void *>(&detourMobGetInterpolatedBodyYaw),
+                &mMobBodyYawOriginal,
+                pl::memory::HookPriority::Normal) != 0) {
+            mMobBodyYawTarget = nullptr;
+            mMobBodyYawOriginal = nullptr;
+        }
+        logger.info("[PaperDollTouch] Hooked Mob interpolated rotation getters ({})", mobInterpSource);
+    }
+
+    if (anyRendererHooked) {
+        mState.hookInstalled.store(true, std::memory_order_release);
+        writeDiagnosticProbeReport(true, liveSource, paperDollSource, dataDrivenSource, mobInterpSource);
+        return true;
+    }
 #endif
+
+    logger.warn("[PaperDollTouch] Could not resolve Inventory renderer vtables (live={}, paperDoll={}).",
+                liveSource, paperDollSource);
+    writeDiagnosticProbeReport(false, liveSource, paperDollSource, dataDrivenSource, mobInterpSource);
+    return false;
 }
 
 void PaperDollTouchMod::registerInputHandlers() noexcept {
@@ -490,7 +504,9 @@ void PaperDollTouchMod::registerInputHandlers() noexcept {
     }
 
 #if PDT_HAS_PL_HOOK
-    if (!mPlInputCallbackRegistered && mConfig.allowNativeInputQueueFallback && !mInputQueueHookInstalled) {
+    // Always install AInputQueue_getEvent observer as well (with deduplication in onTouchEvent)
+    // because Minecraft Bedrock Android reads native touch events directly from AInputQueue.
+    if (mConfig.allowNativeInputQueueFallback && !mInputQueueHookInstalled) {
         void *sym = dlsym(RTLD_DEFAULT, "AInputQueue_getEvent");
         if (sym != nullptr) {
             mInputQueueGetEventTarget = sym;
@@ -501,7 +517,7 @@ void PaperDollTouchMod::registerInputHandlers() noexcept {
                     pl::memory::HookPriority::Normal) == 0 &&
                 mInputQueueGetEventOriginal != nullptr) {
                 mInputQueueHookInstalled = true;
-                getSelf().getLogger().info("[PaperDollTouch] Attached non-intrusive AInputQueue_getEvent touch observer.");
+                getSelf().getLogger().info("[PaperDollTouch] Attached native AInputQueue_getEvent touch observer.");
             } else {
                 mInputQueueGetEventTarget = nullptr;
                 mInputQueueGetEventOriginal = nullptr;
@@ -513,29 +529,49 @@ void PaperDollTouchMod::registerInputHandlers() noexcept {
 
 void PaperDollTouchMod::removeHooks() noexcept {
 #if PDT_HAS_PL_HOOK
-    if (mState.hookInstalled.load(std::memory_order_acquire) && mHudPlayerRenderTarget != nullptr) {
-        pl::memory::unhook(
-            mHudPlayerRenderTarget,
-            reinterpret_cast<void *>(&detourHudPlayerRendererRender)
-        );
+    if (mLivePlayerRenderTarget != nullptr) {
+        pl::memory::unhook(mLivePlayerRenderTarget, reinterpret_cast<void *>(&detourLivePlayerRendererRender));
+        mLivePlayerRenderTarget = nullptr;
+        mLivePlayerRenderOriginal = nullptr;
+    }
+    if (mPaperDollRenderTarget != nullptr) {
+        pl::memory::unhook(mPaperDollRenderTarget, reinterpret_cast<void *>(&detourPaperDollRendererRender));
+        mPaperDollRenderTarget = nullptr;
+        mPaperDollRenderOriginal = nullptr;
+    }
+    if (mPaperDollRenderGuiTarget != nullptr) {
+        pl::memory::unhook(mPaperDollRenderGuiTarget, reinterpret_cast<void *>(&detourPaperDollRenderGui));
+        mPaperDollRenderGuiTarget = nullptr;
+        mPaperDollRenderGuiOriginal = nullptr;
+    }
+    if (mDataDrivenRenderTarget != nullptr) {
+        pl::memory::unhook(mDataDrivenRenderTarget, reinterpret_cast<void *>(&detourDataDrivenRendererRender));
+        mDataDrivenRenderTarget = nullptr;
+        mDataDrivenRenderOriginal = nullptr;
+    }
+    if (mMobBodyRotTarget != nullptr) {
+        pl::memory::unhook(mMobBodyRotTarget, reinterpret_cast<void *>(&detourMobGetInterpolatedBodyRot));
+        mMobBodyRotTarget = nullptr;
+        mMobBodyRotOriginal = nullptr;
+    }
+    if (mMobHeadRotTarget != nullptr) {
+        pl::memory::unhook(mMobHeadRotTarget, reinterpret_cast<void *>(&detourMobGetInterpolatedHeadRot));
+        mMobHeadRotTarget = nullptr;
+        mMobHeadRotOriginal = nullptr;
+    }
+    if (mMobBodyYawTarget != nullptr) {
+        pl::memory::unhook(mMobBodyYawTarget, reinterpret_cast<void *>(&detourMobGetInterpolatedBodyYaw));
+        mMobBodyYawTarget = nullptr;
+        mMobBodyYawOriginal = nullptr;
     }
     if (mInputQueueHookInstalled && mInputQueueGetEventTarget != nullptr) {
-        pl::memory::unhook(
-            mInputQueueGetEventTarget,
-            reinterpret_cast<void *>(&detourAInputQueueGetEvent)
-        );
+        pl::memory::unhook(mInputQueueGetEventTarget, reinterpret_cast<void *>(&detourAInputQueueGetEvent));
         mInputQueueHookInstalled = false;
         mInputQueueGetEventTarget = nullptr;
         mInputQueueGetEventOriginal = nullptr;
     }
 #endif
     mState.hookInstalled.store(false, std::memory_order_release);
-    mHudPlayerRenderTarget = nullptr;
-    mHudPlayerRenderOriginal = nullptr;
-    mGetLocalPlayerFn = nullptr;
-    mActorGetRotationFn = nullptr;
-    mActorGetYHeadRotFn = nullptr;
-    mActorSetYHeadRotFn = nullptr;
 }
 
 bool PaperDollTouchMod::enable() {
@@ -551,9 +587,10 @@ bool PaperDollTouchMod::enable() {
 
     mState.modActive.store(true, std::memory_order_release);
     self.getLogger().info(
-        "PaperDollTouch enabled (Renderer Hook: {}, Input Handler: {}).",
-        mState.hookInstalled.load(std::memory_order_acquire) ? "ACTIVE" : "FAIL-SAFE STANDBY",
-        (mPlInputCallbackRegistered || mInputQueueHookInstalled) ? "READY" : "INACTIVE"
+        "PaperDollTouch v1.1.0 enabled (Renderer Hooks: {}, Input Handlers: plInput={}, AInputQueue={}).",
+        mState.hookInstalled.load(std::memory_order_acquire) ? "ACTIVE" : "STANDBY",
+        mPlInputCallbackRegistered,
+        mInputQueueHookInstalled
     );
     return true;
 }
@@ -640,6 +677,22 @@ bool PaperDollTouchMod::onTouchEvent(int action, int pointerId, float x, float y
         return false;
     }
 
+    const std::int64_t nowMs = monotonicMillis();
+    const int maskedAction = action & AMOTION_EVENT_ACTION_MASK;
+
+    // Deduplicate identical touch events if both pl::input and AInputQueue fire within 4ms
+    const std::int64_t prevEventMs = mState.lastTouchEventMs.load(std::memory_order_relaxed);
+    if ((nowMs - prevEventMs) <= 4 &&
+        mState.lastTouchAction.load(std::memory_order_relaxed) == maskedAction &&
+        std::fabs(mState.lastRawEventX.load(std::memory_order_relaxed) - x) < 0.5f &&
+        std::fabs(mState.lastRawEventY.load(std::memory_order_relaxed) - y) < 0.5f) {
+        return false;
+    }
+    mState.lastTouchEventMs.store(nowMs, std::memory_order_relaxed);
+    mState.lastTouchAction.store(maskedAction, std::memory_order_relaxed);
+    mState.lastRawEventX.store(x, std::memory_order_relaxed);
+    mState.lastRawEventY.store(y, std::memory_order_relaxed);
+
     // Opportunistically calibrate physical screen dimensions without syscalls
     float currentSw = mState.screenWidth.load(std::memory_order_relaxed);
     float currentSh = mState.screenHeight.load(std::memory_order_relaxed);
@@ -648,8 +701,7 @@ bool PaperDollTouchMod::onTouchEvent(int action, int pointerId, float x, float y
     if (y > currentSh && y < 16384.0f)
         mState.screenHeight.store(y, std::memory_order_relaxed);
 
-    // Check if the inventory paper doll was rendered within the last 160 ms
-    const std::int64_t nowMs = monotonicMillis();
+    // Check if the inventory paper doll was rendered within the last 220 ms
     const std::int64_t lastRenderMs = mState.lastInventoryRenderMs.load(std::memory_order_acquire);
     const bool inventoryOpen = (lastRenderMs > 0) && ((nowMs - lastRenderMs) <= kInventoryRenderTimeoutMs);
 
@@ -660,13 +712,12 @@ bool PaperDollTouchMod::onTouchEvent(int action, int pointerId, float x, float y
         return false;
     }
 
-    const int maskedAction = action & AMOTION_EVENT_ACTION_MASK;
     const int trackedPointer = mState.activePointerId.load(std::memory_order_relaxed);
 
     switch (maskedAction) {
     case AMOTION_EVENT_ACTION_DOWN:
     case AMOTION_EVENT_ACTION_POINTER_DOWN: {
-        // Only lock pointerId if no pointer is active AND touch starts inside the character preview bounds
+        // Lock pointerId if no pointer is active AND touch starts inside the character preview bounds
         if (trackedPointer == -1 && isPointInsidePreviewBounds(x, y)) {
             mState.activePointerId.store(pointerId, std::memory_order_relaxed);
             mState.lastTouchX.store(x, std::memory_order_relaxed);
@@ -686,7 +737,7 @@ bool PaperDollTouchMod::onTouchEvent(int action, int pointerId, float x, float y
             mState.lastTouchX.store(x, std::memory_order_relaxed);
             mState.lastTouchY.store(y, std::memory_order_relaxed);
 
-            if (std::fabs(deltaX) > 0.20f || std::fabs(deltaY) > 0.20f) {
+            if (std::fabs(deltaX) > 0.15f || std::fabs(deltaY) > 0.15f) {
                 float yaw = mState.targetYawOffset.load(std::memory_order_relaxed);
                 float pitch = mState.targetPitchOffset.load(std::memory_order_relaxed);
 
@@ -721,44 +772,11 @@ bool PaperDollTouchMod::onTouchEvent(int action, int pointerId, float x, float y
     return false;
 }
 
-void PaperDollTouchMod::onHudPlayerRenderDetour(
-    void *self,
-    void *renderContext,
-    void *clientInstance,
-    void *uiControl,
-    int pass,
-    McRectangleArea *rectArea
-) noexcept {
-    auto originalFn = reinterpret_cast<HudPlayerRendererRenderFn>(mHudPlayerRenderOriginal);
-    if (originalFn == nullptr) {
-        return;
-    }
-
-    if (!mState.modActive.load(std::memory_order_acquire) ||
-        clientInstance == nullptr ||
-        rectArea == nullptr ||
-        mGetLocalPlayerFn == nullptr) {
-        originalFn(self, renderContext, clientInstance, uiControl, pass, rectArea);
-        return;
-    }
-
-    // Distinguish Inventory Paper Doll panel from the small top-left HUD Paper Doll
-    const float rectWidth = rectArea->x1 - rectArea->x0;
-    const float rectHeight = rectArea->y1 - rectArea->y0;
-    const bool isInventoryPanel = (rectWidth >= kMinInventoryPreviewWidthUi) &&
-                                  (rectHeight >= kMinInventoryPreviewHeightUi) &&
-                                  (rectArea->x0 > 12.0f);
-
-    if (!isInventoryPanel) {
-        originalFn(self, renderContext, clientInstance, uiControl, pass, rectArea);
-        return;
-    }
-
+void PaperDollTouchMod::stepOrientationSmoothing() noexcept {
     mState.lastInventoryRenderMs.store(monotonicMillis(), std::memory_order_release);
     mState.inventoryPreviewVisible.store(true, std::memory_order_release);
     mState.renderedPreviewFrames.fetch_add(1, std::memory_order_relaxed);
 
-    // Exponential smoothing on Render Thread (zero extra threads, zero allocations)
     const float targetYaw = mState.targetYawOffset.load(std::memory_order_relaxed);
     const float targetPitch = mState.targetPitchOffset.load(std::memory_order_relaxed);
     float curYaw = mState.currentYawOffset.load(std::memory_order_relaxed);
@@ -770,116 +788,258 @@ void PaperDollTouchMod::onHudPlayerRenderDetour(
 
     mState.currentYawOffset.store(curYaw, std::memory_order_relaxed);
     mState.currentPitchOffset.store(curPitch, std::memory_order_relaxed);
+}
+
+void PaperDollTouchMod::applyPaperDollRendererFields(void *paperDollRenderer) noexcept {
+    if (paperDollRenderer == nullptr)
+        return;
+
+    const float curYaw = mState.currentYawOffset.load(std::memory_order_relaxed);
+    const float curPitch = mState.currentPitchOffset.load(std::memory_order_relaxed);
+    if (std::fabs(curYaw) < 0.01f && std::fabs(curPitch) < 0.01f)
+        return;
+
+    // PaperDollRenderer POD field layout (64-bit ARM64):
+    // +0x0C: int mRotationStyle (CustomY = 3)
+    // +0x20: float mRotation
+    // +0x24: float mTargetRotation
+    // +0x28: float mCameraTiltInDeg
+    auto *base = static_cast<std::uint8_t *>(paperDollRenderer);
+    auto *rotStyle = reinterpret_cast<int *>(base + 0x0C);
+    auto *rot = reinterpret_cast<float *>(base + 0x20);
+    auto *targetRot = reinterpret_cast<float *>(base + 0x24);
+    auto *tilt = reinterpret_cast<float *>(base + 0x28);
+
+    if (*rotStyle >= 0 && *rotStyle <= 6 &&
+        isValidRotationFloat(*rot) &&
+        isValidRotationFloat(*targetRot) &&
+        isValidRotationFloat(*tilt)) {
+        *rotStyle = 3; // CustomY
+        *rot += curYaw;
+        *targetRot = *rot;
+        *tilt = std::clamp(*tilt + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
+    }
+}
+
+void PaperDollTouchMod::onLivePlayerRenderDetour(
+    void *self,
+    void *renderContext,
+    void *clientInstance,
+    void *uiControl,
+    int pass
+) noexcept {
+    auto originalFn = reinterpret_cast<UICustomRendererRenderFn>(mLivePlayerRenderOriginal);
+    if (originalFn == nullptr)
+        return;
+
+    if (!mState.modActive.load(std::memory_order_acquire)) {
+        originalFn(self, renderContext, clientInstance, uiControl, pass);
+        return;
+    }
+
+    stepOrientationSmoothing();
+    ScopedInventoryPass passGuard(mState.inInventoryRenderPass);
+    originalFn(self, renderContext, clientInstance, uiControl, pass);
+}
+
+void PaperDollTouchMod::onPaperDollRenderDetour(
+    void *self,
+    void *renderContext,
+    void *clientInstance,
+    void *uiControl,
+    int pass
+) noexcept {
+    auto originalFn = reinterpret_cast<UICustomRendererRenderFn>(mPaperDollRenderOriginal);
+    if (originalFn == nullptr)
+        return;
+
+    if (!mState.modActive.load(std::memory_order_acquire)) {
+        originalFn(self, renderContext, clientInstance, uiControl, pass);
+        return;
+    }
+
+    stepOrientationSmoothing();
+    applyPaperDollRendererFields(self);
+    ScopedInventoryPass passGuard(mState.inInventoryRenderPass);
+    originalFn(self, renderContext, clientInstance, uiControl, pass);
+}
+
+void PaperDollTouchMod::onPaperDollRenderGuiDetour(
+    void *self,
+    const void *rendererName,
+    McActorRenderDataPrefix *actorRenderData,
+    const void *captureDesc
+) noexcept {
+    auto originalFn = reinterpret_cast<PaperDollRenderGuiFn>(mPaperDollRenderGuiOriginal);
+    if (originalFn == nullptr)
+        return;
+
+    if (!mState.modActive.load(std::memory_order_acquire) ||
+        !mState.inInventoryRenderPass.load(std::memory_order_acquire) ||
+        actorRenderData == nullptr) {
+        originalFn(self, rendererName, actorRenderData, captureDesc);
+        return;
+    }
+
+    const float curYaw = mState.currentYawOffset.load(std::memory_order_relaxed);
+    const float curPitch = mState.currentPitchOffset.load(std::memory_order_relaxed);
 
     if (std::fabs(curYaw) < 0.01f && std::fabs(curPitch) < 0.01f) {
-        originalFn(self, renderContext, clientInstance, uiControl, pass, rectArea);
+        originalFn(self, rendererName, actorRenderData, captureDesc);
         return;
     }
 
-    auto getLocalPlayer = reinterpret_cast<GetLocalPlayerFn>(mGetLocalPlayerFn);
-    void *localPlayer = getLocalPlayer(clientInstance);
-    if (localPlayer == nullptr) {
-        originalFn(self, renderContext, clientInstance, uiControl, pass, rectArea);
+    const float savedPitch = actorRenderData->rotPitch;
+    const float savedYaw = actorRenderData->rotYaw;
+    const float savedHeadPitch = actorRenderData->headRotPitch;
+    const float savedHeadYaw = actorRenderData->headRotYaw;
+
+    if (isValidRotationFloat(savedPitch) && isValidRotationFloat(savedYaw)) {
+        actorRenderData->rotPitch = std::clamp(savedPitch + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
+        actorRenderData->rotYaw = savedYaw + curYaw;
+        if (isValidRotationFloat(savedHeadPitch))
+            actorRenderData->headRotPitch = std::clamp(savedHeadPitch + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
+        if (isValidRotationFloat(savedHeadYaw))
+            actorRenderData->headRotYaw = savedHeadYaw + curYaw;
+    }
+
+    originalFn(self, rendererName, actorRenderData, captureDesc);
+
+    actorRenderData->rotPitch = savedPitch;
+    actorRenderData->rotYaw = savedYaw;
+    actorRenderData->headRotPitch = savedHeadPitch;
+    actorRenderData->headRotYaw = savedHeadYaw;
+}
+
+void PaperDollTouchMod::onDataDrivenRenderDetour(
+    void *self,
+    void *baseActorRenderContext,
+    McActorRenderDataPrefix *actorRenderData
+) noexcept {
+    auto originalFn = reinterpret_cast<DataDrivenRenderFn>(mDataDrivenRenderOriginal);
+    if (originalFn == nullptr)
+        return;
+
+    // Only apply rotation override during LivePlayerRenderer::render or PaperDollRenderer::render
+    if (!mState.modActive.load(std::memory_order_acquire) ||
+        !mState.inInventoryRenderPass.load(std::memory_order_acquire) ||
+        actorRenderData == nullptr) {
+        originalFn(self, baseActorRenderContext, actorRenderData);
         return;
     }
 
-    // Path A: Offset-free rotation override via Actor::getRotation() const (returns Vec2& inside ActorRotationComponent)
-    if (mActorGetRotationFn != nullptr) {
-        auto getRotation = reinterpret_cast<ActorGetRotationFn>(mActorGetRotationFn);
-        const McVec2 *rotConstPtr = getRotation(localPlayer);
-        if (rotConstPtr != nullptr &&
-            isValidRotationFloat(rotConstPtr->x) &&
-            isValidRotationFloat(rotConstPtr->y)) {
-            auto *rotMutable = const_cast<McVec2 *>(rotConstPtr);
-            const float savedPitch = rotMutable->x;
-            const float savedYaw = rotMutable->y;
+    const float curYaw = mState.currentYawOffset.load(std::memory_order_relaxed);
+    const float curPitch = mState.currentPitchOffset.load(std::memory_order_relaxed);
 
-            rotMutable->x = std::clamp(savedPitch + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
-            rotMutable->y = savedYaw + curYaw;
+    if (std::fabs(curYaw) < 0.01f && std::fabs(curPitch) < 0.01f) {
+        originalFn(self, baseActorRenderContext, actorRenderData);
+        return;
+    }
 
-            float savedHeadYaw = 0.0f;
-            bool hasHeadRotFn = (mActorGetYHeadRotFn != nullptr && mActorSetYHeadRotFn != nullptr);
-            if (hasHeadRotFn) {
-                auto getHead = reinterpret_cast<ActorGetYHeadRotFn>(mActorGetYHeadRotFn);
-                auto setHead = reinterpret_cast<ActorSetYHeadRotFn>(mActorSetYHeadRotFn);
-                savedHeadYaw = getHead(localPlayer);
-                if (isValidRotationFloat(savedHeadYaw)) {
-                    setHead(localPlayer, savedHeadYaw + curYaw);
-                } else {
-                    hasHeadRotFn = false;
+    const float savedPitch = actorRenderData->rotPitch;
+    const float savedYaw = actorRenderData->rotYaw;
+    const float savedHeadPitch = actorRenderData->headRotPitch;
+    const float savedHeadYaw = actorRenderData->headRotYaw;
+
+    // Also locate ActorRotationComponent (float mPitch, mYaw, mOldPitch, mOldYaw) inside mActor's BuiltInActorComponents
+    // so Molang queries (query.head_x_rotation, query.head_y_rotation, query.body_y_rotation) rotate in tandem.
+    float *actorRotCompFloats = nullptr;
+    float savedCompFloats[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (actorRenderData->mActor != nullptr &&
+        isValidRotationFloat(savedPitch) &&
+        isValidRotationFloat(savedYaw)) {
+        auto *actorBytes = static_cast<std::uint8_t *>(actorRenderData->mActor);
+        const std::uintptr_t actorAddr = reinterpret_cast<std::uintptr_t>(actorBytes);
+        // BuiltInActorComponents is embedded inside Actor within +0x18..+0x98
+        for (std::size_t off = 0x18; off <= 0x98; off += sizeof(void *)) {
+            void *candPtr = *reinterpret_cast<void **>(actorBytes + off);
+            const std::uintptr_t candAddr = reinterpret_cast<std::uintptr_t>(candPtr);
+            if (candAddr > 0x10000ULL && (candAddr & 0x3ULL) == 0ULL &&
+                std::llabs(static_cast<long long>(candAddr) - static_cast<long long>(actorAddr)) < 0x40000000LL) {
+                auto *f = static_cast<float *>(candPtr);
+                if (std::isfinite(f[0]) && std::isfinite(f[1]) &&
+                    std::fabs(f[0] - savedPitch) < 0.05f &&
+                    std::fabs(f[1] - savedYaw) < 0.05f &&
+                    isValidRotationFloat(f[2]) && isValidRotationFloat(f[3])) {
+                    actorRotCompFloats = f;
+                    savedCompFloats[0] = f[0];
+                    savedCompFloats[1] = f[1];
+                    savedCompFloats[2] = f[2];
+                    savedCompFloats[3] = f[3];
+                    const float newCompPitch = std::clamp(savedCompFloats[0] + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
+                    const float newCompYaw = savedCompFloats[1] + curYaw;
+                    f[0] = newCompPitch;
+                    f[1] = newCompYaw;
+                    f[2] = newCompPitch;
+                    f[3] = newCompYaw;
+                    break;
                 }
             }
-
-            originalFn(self, renderContext, clientInstance, uiControl, pass, rectArea);
-
-            rotMutable->x = savedPitch;
-            rotMutable->y = savedYaw;
-            if (hasHeadRotFn) {
-                auto setHead = reinterpret_cast<ActorSetYHeadRotFn>(mActorSetYHeadRotFn);
-                setHead(localPlayer, savedHeadYaw);
-            }
-            return;
         }
     }
 
-    // Path B: Verified byte offsets on LocalPlayer* (with strict alignment & finite-float guards)
-    if (mConfig.verifiedSignaturesReady &&
-        mConfig.actorRotYawOffset > 0 &&
-        mConfig.actorRotPitchOffset > 0 &&
-        (mConfig.actorRotYawOffset % 4 == 0) &&
-        (mConfig.actorRotPitchOffset % 4 == 0)) {
-        auto *basePtr = static_cast<std::uint8_t *>(localPlayer);
-        auto *actorYawPtr = reinterpret_cast<float *>(basePtr + mConfig.actorRotYawOffset);
-        auto *actorPitchPtr = reinterpret_cast<float *>(basePtr + mConfig.actorRotPitchOffset);
-
-        if (!isValidRotationFloat(*actorYawPtr) || !isValidRotationFloat(*actorPitchPtr)) {
-            originalFn(self, renderContext, clientInstance, uiControl, pass, rectArea);
-            return;
-        }
-
-        const float savedActorYaw = *actorYawPtr;
-        const float savedActorPitch = *actorPitchPtr;
-
-        float *bodyYawPtr = nullptr;
-        float *headYawPtr = nullptr;
-        float savedBodyYaw = 0.0f;
-        float savedHeadYaw = 0.0f;
-
-        if (mConfig.mobBodyYawOffset > 0 && (mConfig.mobBodyYawOffset % 4 == 0)) {
-            auto *candidate = reinterpret_cast<float *>(basePtr + mConfig.mobBodyYawOffset);
-            if (isValidRotationFloat(*candidate)) {
-                bodyYawPtr = candidate;
-                savedBodyYaw = *bodyYawPtr;
-            }
-        }
-        if (mConfig.mobHeadYawOffset > 0 && (mConfig.mobHeadYawOffset % 4 == 0)) {
-            auto *candidate = reinterpret_cast<float *>(basePtr + mConfig.mobHeadYawOffset);
-            if (isValidRotationFloat(*candidate)) {
-                headYawPtr = candidate;
-                savedHeadYaw = *headYawPtr;
-            }
-        }
-
-        *actorYawPtr = savedActorYaw + curYaw;
-        *actorPitchPtr = std::clamp(savedActorPitch + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
-        if (bodyYawPtr)
-            *bodyYawPtr = savedBodyYaw + curYaw;
-        if (headYawPtr)
-            *headYawPtr = savedHeadYaw + curYaw;
-
-        originalFn(self, renderContext, clientInstance, uiControl, pass, rectArea);
-
-        // Immediately restore world orientation so player camera in world is untouched
-        *actorYawPtr = savedActorYaw;
-        *actorPitchPtr = savedActorPitch;
-        if (bodyYawPtr)
-            *bodyYawPtr = savedBodyYaw;
-        if (headYawPtr)
-            *headYawPtr = savedHeadYaw;
-        return;
+    if (isValidRotationFloat(savedPitch) && isValidRotationFloat(savedYaw)) {
+        actorRenderData->rotPitch = std::clamp(savedPitch + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
+        actorRenderData->rotYaw = savedYaw + curYaw;
+        if (isValidRotationFloat(savedHeadPitch))
+            actorRenderData->headRotPitch = std::clamp(savedHeadPitch + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
+        if (isValidRotationFloat(savedHeadYaw))
+            actorRenderData->headRotYaw = savedHeadYaw + curYaw;
     }
 
-    originalFn(self, renderContext, clientInstance, uiControl, pass, rectArea);
+    originalFn(self, baseActorRenderContext, actorRenderData);
+
+    actorRenderData->rotPitch = savedPitch;
+    actorRenderData->rotYaw = savedYaw;
+    actorRenderData->headRotPitch = savedHeadPitch;
+    actorRenderData->headRotYaw = savedHeadYaw;
+
+    if (actorRotCompFloats != nullptr) {
+        actorRotCompFloats[0] = savedCompFloats[0];
+        actorRotCompFloats[1] = savedCompFloats[1];
+        actorRotCompFloats[2] = savedCompFloats[2];
+        actorRotCompFloats[3] = savedCompFloats[3];
+    }
+}
+
+float PaperDollTouchMod::onMobGetInterpolatedBodyRotDetour(const void *self, float partialTicks) noexcept {
+    auto originalFn = reinterpret_cast<MobGetInterpolatedRotFn>(mMobBodyRotOriginal);
+    if (!originalFn)
+        return 0.0f;
+
+    const float val = originalFn(self, partialTicks);
+    if (mState.modActive.load(std::memory_order_acquire) &&
+        mState.inInventoryRenderPass.load(std::memory_order_acquire)) {
+        return val + mState.currentYawOffset.load(std::memory_order_relaxed);
+    }
+    return val;
+}
+
+float PaperDollTouchMod::onMobGetInterpolatedHeadRotDetour(const void *self, float partialTicks) noexcept {
+    auto originalFn = reinterpret_cast<MobGetInterpolatedRotFn>(mMobHeadRotOriginal);
+    if (!originalFn)
+        return 0.0f;
+
+    const float val = originalFn(self, partialTicks);
+    if (mState.modActive.load(std::memory_order_acquire) &&
+        mState.inInventoryRenderPass.load(std::memory_order_acquire)) {
+        return val + mState.currentYawOffset.load(std::memory_order_relaxed);
+    }
+    return val;
+}
+
+float PaperDollTouchMod::onMobGetInterpolatedBodyYawDetour(const void *self, float partialTicks) noexcept {
+    auto originalFn = reinterpret_cast<MobGetInterpolatedRotFn>(mMobBodyYawOriginal);
+    if (!originalFn)
+        return 0.0f;
+
+    const float val = originalFn(self, partialTicks);
+    if (mState.modActive.load(std::memory_order_acquire) &&
+        mState.inInventoryRenderPass.load(std::memory_order_acquire)) {
+        return val + mState.currentYawOffset.load(std::memory_order_relaxed);
+    }
+    return val;
 }
 
 } // namespace paperdoll

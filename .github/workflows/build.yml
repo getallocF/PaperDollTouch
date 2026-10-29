@@ -65,7 +65,7 @@ jobs:
             echo "ERROR: Template string clange_me still present in binary!" >&2
             exit 1
           fi
-          strings dist/libPaperDollTouch.so | grep -E "PaperDollTouch|HudPlayerRenderer|actorRotYawOffset" | head -n 30 | tee -a dist/ELF_VERIFICATION.txt || true
+          strings dist/libPaperDollTouch.so | grep -E "PaperDollTouch|LivePlayerRenderer|PaperDollRenderer|DataDrivenRenderer" | head -n 30 | tee -a dist/ELF_VERIFICATION.txt || true
 
           echo "=== .levipack Archive Contents ===" | tee -a dist/ELF_VERIFICATION.txt
           unzip -l dist/PaperDollTouch.levipack | tee -a dist/ELF_VERIFICATION.txt

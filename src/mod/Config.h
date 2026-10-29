@@ -8,22 +8,22 @@
 namespace paperdoll {
 
 struct ModConfig {
-    int version = 1;
+    int version = 2;
     bool enabled = true;
-    float sensitivityYaw = 0.45f;
-    float sensitivityPitch = 0.30f;
+    float sensitivityYaw = 0.55f;
+    float sensitivityPitch = 0.35f;
     bool invertVertical = false;
     float maxPitchDegrees = 45.0f;
     bool resetOnInventoryClose = true;
-    float smoothingFactor = 0.35f;
+    float smoothingFactor = 0.40f;
 
-    // Normalized touch hit-box bounds [0.0, 1.0] for inventory character preview panel
-    float boundsMinX = 0.24f;
-    float boundsMinY = 0.14f;
-    float boundsMaxX = 0.44f;
-    float boundsMaxY = 0.56f;
+    // Normalized touch hit-box bounds [0.0, 1.0] covering both Classic & Pocket inventory character panels
+    float boundsMinX = 0.04f;
+    float boundsMinY = 0.06f;
+    float boundsMaxX = 0.68f;
+    float boundsMaxY = 0.82f;
 
-    // Target Minecraft Bedrock version and runtime symbol/signature resolution settings
+    // Target Minecraft Bedrock version and runtime RTTI vtable / symbol resolution settings
     std::string expectedMinecraftVersion = "26.60";
     bool allowSymbolAutoProbe = true;
     bool allowNativeInputQueueFallback = true;
@@ -35,7 +35,6 @@ struct ModConfig {
     std::string actorGetRotationSig = "";
 
     // Optional verified LocalPlayer/Actor float offsets (in bytes, 4-byte aligned)
-    // Only used when Actor::getRotation() symbol is unavailable and verifiedSignaturesReady=true
     int actorRotYawOffset = 0;
     int actorRotPitchOffset = 0;
     int mobBodyYawOffset = 0;
@@ -80,25 +79,25 @@ template <> struct pl::config::Schema<paperdoll::ModConfig> {
         if (name == "expectedMinecraftVersion")
             return {.title = "Expected Minecraft Version", .description = "Target Minecraft Bedrock version string (26.60)."};
         if (name == "allowSymbolAutoProbe")
-            return {.title = "Allow ELF Symbol Auto-Probe", .description = "Automatically inspect libminecraftpe.so dynamic symbols at enable-time for HudPlayerRenderer::render and Actor::getRotation."};
+            return {.title = "Allow RTTI Vtable & Symbol Auto-Probe", .description = "Automatically resolve LivePlayerRenderer, PaperDollRenderer, DataDrivenRenderer, and Mob vtables in libminecraftpe.so."};
         if (name == "allowNativeInputQueueFallback")
-            return {.title = "Allow AInputQueue Fallback", .description = "Hook Android AInputQueue_getEvent non-destructively if Preloader Input API callback is unavailable."};
+            return {.title = "Allow AInputQueue Touch Hook", .description = "Hook Android AInputQueue_getEvent non-destructively alongside Preloader Input API."};
         if (name == "verifiedSignaturesReady")
-            return {.title = "Verified Signatures Ready", .description = "Enable byte-signature and struct-offset hooking when custom 26.60 signatures/offsets are populated."};
+            return {.title = "Verified Signatures Ready", .description = "Enable custom byte-signature and struct-offset overrides if populated."};
         if (name == "hudPlayerRendererRenderSig")
-            return {.title = "HudPlayerRenderer::render Signature", .description = "Mangled symbol or AArch64 byte signature for HudPlayerRenderer::render in libminecraftpe.so."};
+            return {.title = "LivePlayerRenderer::render Signature Override", .description = "Optional custom signature override for LivePlayerRenderer::render in libminecraftpe.so."};
         if (name == "getLocalPlayerFromClientSig")
-            return {.title = "ClientInstance::getLocalPlayer Signature", .description = "Mangled symbol or AArch64 byte signature for ClientInstance::getLocalPlayer in libminecraftpe.so."};
+            return {.title = "ClientInstance::getLocalPlayer Signature Override", .description = "Optional custom signature override for ClientInstance::getLocalPlayer in libminecraftpe.so."};
         if (name == "actorGetRotationSig")
-            return {.title = "Actor::getRotation Signature", .description = "Mangled symbol or AArch64 byte signature for Actor::getRotation in libminecraftpe.so."};
+            return {.title = "Actor::getRotation Signature Override", .description = "Optional custom signature override for Actor::getRotation in libminecraftpe.so."};
         if (name == "actorRotYawOffset")
-            return {.title = "Actor Yaw Offset", .description = "Verified byte offset of yaw float in LocalPlayer/Actor (0 if using Actor::getRotation)."};
+            return {.title = "Actor Yaw Offset", .description = "Optional verified byte offset of yaw float in LocalPlayer/Actor."};
         if (name == "actorRotPitchOffset")
-            return {.title = "Actor Pitch Offset", .description = "Verified byte offset of pitch float in LocalPlayer/Actor (0 if using Actor::getRotation)."};
+            return {.title = "Actor Pitch Offset", .description = "Optional verified byte offset of pitch float in LocalPlayer/Actor."};
         if (name == "mobBodyYawOffset")
-            return {.title = "Mob Body Yaw Offset", .description = "Verified byte offset of body yaw float in LocalPlayer/Mob (optional)."};
+            return {.title = "Mob Body Yaw Offset", .description = "Optional verified byte offset of body yaw float in LocalPlayer/Mob."};
         if (name == "mobHeadYawOffset")
-            return {.title = "Mob Head Yaw Offset", .description = "Verified byte offset of head yaw float in LocalPlayer/Mob (optional)."};
+            return {.title = "Mob Head Yaw Offset", .description = "Optional verified byte offset of head yaw float in LocalPlayer/Mob."};
         return {};
     }
 };

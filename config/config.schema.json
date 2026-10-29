@@ -8,7 +8,7 @@
       "type": "integer",
       "title": "Config Version",
       "readOnly": true,
-      "default": 1
+      "default": 2
     },
     "enabled": {
       "type": "boolean",
@@ -18,12 +18,12 @@
     "sensitivityYaw": {
       "type": "number",
       "title": "Horizontal Yaw Sensitivity",
-      "default": 0.45
+      "default": 0.55
     },
     "sensitivityPitch": {
       "type": "number",
       "title": "Vertical Pitch Sensitivity",
-      "default": 0.3
+      "default": 0.35
     },
     "invertVertical": {
       "type": "boolean",
@@ -43,27 +43,27 @@
     "smoothingFactor": {
       "type": "number",
       "title": "Smoothing Factor",
-      "default": 0.35
+      "default": 0.4
     },
     "boundsMinX": {
       "type": "number",
       "title": "Preview Bounds Min X",
-      "default": 0.24
+      "default": 0.04
     },
     "boundsMinY": {
       "type": "number",
       "title": "Preview Bounds Min Y",
-      "default": 0.14
+      "default": 0.06
     },
     "boundsMaxX": {
       "type": "number",
       "title": "Preview Bounds Max X",
-      "default": 0.44
+      "default": 0.68
     },
     "boundsMaxY": {
       "type": "number",
       "title": "Preview Bounds Max Y",
-      "default": 0.56
+      "default": 0.82
     },
     "expectedMinecraftVersion": {
       "type": "string",
@@ -72,12 +72,12 @@
     },
     "allowSymbolAutoProbe": {
       "type": "boolean",
-      "title": "Allow ELF Symbol Auto-Probe",
+      "title": "Allow RTTI Vtable & Symbol Auto-Probe",
       "default": true
     },
     "allowNativeInputQueueFallback": {
       "type": "boolean",
-      "title": "Allow AInputQueue Fallback",
+      "title": "Allow AInputQueue Touch Hook",
       "default": true
     },
     "verifiedSignaturesReady": {
@@ -87,17 +87,17 @@
     },
     "hudPlayerRendererRenderSig": {
       "type": "string",
-      "title": "HudPlayerRenderer::render Signature",
+      "title": "LivePlayerRenderer::render Signature Override",
       "default": ""
     },
     "getLocalPlayerFromClientSig": {
       "type": "string",
-      "title": "ClientInstance::getLocalPlayer Signature",
+      "title": "ClientInstance::getLocalPlayer Signature Override",
       "default": ""
     },
     "actorGetRotationSig": {
       "type": "string",
-      "title": "Actor::getRotation Signature",
+      "title": "Actor::getRotation Signature Override",
       "default": ""
     },
     "actorRotYawOffset": {

@@ -11,18 +11,26 @@
 
 namespace paperdoll {
 
-// Minecraft Bedrock internal UI RectangleArea layout (passed to HudPlayerRenderer::render)
-struct McRectangleArea {
-    float x0{0.0f};
-    float x1{0.0f};
-    float y0{0.0f};
-    float y1{0.0f};
+// Minecraft Bedrock Vec2 layout (pitch, yaw in degrees)
+struct McVec2 {
+    float x{0.0f};
+    float y{0.0f};
 };
 
-// Minecraft Bedrock Vec2 layout (returned by Actor::getRotation() const)
-struct McVec2 {
-    float x{0.0f}; // Pitch (degrees)
-    float y{0.0f}; // Yaw (degrees)
+// Minecraft Bedrock ActorRenderData layout prefix (64-bit ARM64, STL-free POD prefix)
+struct McActorRenderDataPrefix {
+    void *mActor{nullptr};           // +0x00
+    const void *mItemStack{nullptr}; // +0x08
+    float posX{0.0f};                // +0x10
+    float posY{0.0f};                // +0x14
+    float posZ{0.0f};                // +0x18
+    float rotPitch{0.0f};            // +0x1C (rotation.x)
+    float rotYaw{0.0f};              // +0x20 (rotation.y)
+    float headRotPitch{0.0f};        // +0x24 (mHeadRot.x)
+    float headRotYaw{0.0f};          // +0x28 (mHeadRot.y)
+    bool glint{false};               // +0x2C
+    bool mIgnoreLighting{false};     // +0x2D
+    bool mIsInUI{false};             // +0x2E
 };
 
 // Lock-free atomic runtime state shared between Input Thread and RenderDragon UI Thread
@@ -30,24 +38,31 @@ struct RuntimeTouchState {
     std::atomic<bool> modActive{false};
     std::atomic<bool> hookInstalled{false};
     std::atomic<bool> inventoryPreviewVisible{false};
+    std::atomic<bool> inInventoryRenderPass{false};
 
-    // Monotonic timestamp (ms) of the most recent inventory HudPlayerRenderer::render call
+    // Monotonic timestamp (ms) of the most recent Inventory LivePlayerRenderer / PaperDollRenderer render call
     std::atomic<std::int64_t> lastInventoryRenderMs{0};
+
+    // Deduplication state between pl::input callback and AInputQueue_getEvent hook
+    std::atomic<std::int64_t> lastTouchEventMs{0};
+    std::atomic<int> lastTouchAction{-1};
+    std::atomic<float> lastRawEventX{-1.0f};
+    std::atomic<float> lastRawEventY{-1.0f};
 
     // Active touch pointer ID locked ONLY when ACTION_DOWN starts inside paper doll preview bounds
     std::atomic<std::int32_t> activePointerId{-1};
     std::atomic<float> lastTouchX{0.0f};
     std::atomic<float> lastTouchY{0.0f};
 
-    // Calibrated physical screen dimensions (pixels)
-    std::atomic<float> screenWidth{2400.0f};
-    std::atomic<float> screenHeight{1080.0f};
+    // Calibrated physical screen dimensions (pixels) - starts at 1280x720 and expands dynamically
+    std::atomic<float> screenWidth{1280.0f};
+    std::atomic<float> screenHeight{720.0f};
 
     // Normalized [0.0, 1.0] active preview hit-box bounds
-    std::atomic<float> activeBoundsMinX{0.24f};
-    std::atomic<float> activeBoundsMinY{0.14f};
-    std::atomic<float> activeBoundsMaxX{0.44f};
-    std::atomic<float> activeBoundsMaxY{0.56f};
+    std::atomic<float> activeBoundsMinX{0.04f};
+    std::atomic<float> activeBoundsMinY{0.06f};
+    std::atomic<float> activeBoundsMaxX{0.68f};
+    std::atomic<float> activeBoundsMaxY{0.82f};
 
     // Target and smoothed orientation deltas (degrees)
     std::atomic<float> targetYawOffset{0.0f};
@@ -79,17 +94,45 @@ class PaperDollTouchMod {
     // Non-consuming touch handler (always returns false so Minecraft UI slots/buttons work normally)
     bool onTouchEvent(int action, int pointerId, float x, float y) noexcept;
 
-    // Detour handler for HudPlayerRenderer::render on ARM64
-    void onHudPlayerRenderDetour(
+    // Detour for LivePlayerRenderer::render(MinecraftUIRenderContext&, IClientInstance&, UIControl&, int)
+    void onLivePlayerRenderDetour(
         void *self,
         void *renderContext,
         void *clientInstance,
         void *uiControl,
-        int pass,
-        McRectangleArea *rectArea
+        int pass
     ) noexcept;
 
-    // Optional native AInputQueue_getEvent detour fallback
+    // Detour for PaperDollRenderer::render(MinecraftUIRenderContext&, IClientInstance&, UIControl&, int)
+    void onPaperDollRenderDetour(
+        void *self,
+        void *renderContext,
+        void *clientInstance,
+        void *uiControl,
+        int pass
+    ) noexcept;
+
+    // Detour for PaperDollBaseActorRenderContext::renderGui(HashedString const&, ActorRenderData&, OffscreenCaptureDescription const*)
+    void onPaperDollRenderGuiDetour(
+        void *self,
+        const void *rendererName,
+        McActorRenderDataPrefix *actorRenderData,
+        const void *captureDesc
+    ) noexcept;
+
+    // Detour for DataDrivenRenderer::render(BaseActorRenderContext&, ActorRenderData&)
+    void onDataDrivenRenderDetour(
+        void *self,
+        void *baseActorRenderContext,
+        McActorRenderDataPrefix *actorRenderData
+    ) noexcept;
+
+    // Detours for Mob::getInterpolatedBodyRot / getInterpolatedHeadRot / getInterpolatedBodyYaw
+    float onMobGetInterpolatedBodyRotDetour(const void *self, float partialTicks) noexcept;
+    float onMobGetInterpolatedHeadRotDetour(const void *self, float partialTicks) noexcept;
+    float onMobGetInterpolatedBodyYawDetour(const void *self, float partialTicks) noexcept;
+
+    // Native AInputQueue_getEvent detour
     int32_t onInputQueueGetEventDetour(void *queue, void **outEvent) noexcept;
 
   private:
@@ -98,12 +141,15 @@ class PaperDollTouchMod {
     void registerInputHandlers() noexcept;
     void removeHooks() noexcept;
     void resetTouchAndOrientation(bool clearAngles) noexcept;
+    void stepOrientationSmoothing() noexcept;
+    void applyPaperDollRendererFields(void *paperDollRenderer) noexcept;
     bool isPointInsidePreviewBounds(float x, float y) const noexcept;
     void writeDiagnosticProbeReport(
         bool hookReady,
-        const std::string &renderSymSource,
-        const std::string &localPlayerSymSource,
-        const std::string &rotationAccessMode
+        const std::string &liveRenderSource,
+        const std::string &paperDollSource,
+        const std::string &dataDrivenSource,
+        const std::string &mobInterpSource
     ) const noexcept;
 
     static std::int64_t monotonicMillis() noexcept;
@@ -113,12 +159,24 @@ class PaperDollTouchMod {
     std::optional<pl::config::ConfigFile<ModConfig>> mConfigFile{};
     RuntimeTouchState mState{};
 
-    void *mHudPlayerRenderTarget{nullptr};
-    void *mHudPlayerRenderOriginal{nullptr};
-    void *mGetLocalPlayerFn{nullptr};
-    void *mActorGetRotationFn{nullptr};
-    void *mActorGetYHeadRotFn{nullptr};
-    void *mActorSetYHeadRotFn{nullptr};
+    void *mLivePlayerRenderTarget{nullptr};
+    void *mLivePlayerRenderOriginal{nullptr};
+
+    void *mPaperDollRenderTarget{nullptr};
+    void *mPaperDollRenderOriginal{nullptr};
+
+    void *mPaperDollRenderGuiTarget{nullptr};
+    void *mPaperDollRenderGuiOriginal{nullptr};
+
+    void *mDataDrivenRenderTarget{nullptr};
+    void *mDataDrivenRenderOriginal{nullptr};
+
+    void *mMobBodyRotTarget{nullptr};
+    void *mMobBodyRotOriginal{nullptr};
+    void *mMobHeadRotTarget{nullptr};
+    void *mMobHeadRotOriginal{nullptr};
+    void *mMobBodyYawTarget{nullptr};
+    void *mMobBodyYawOriginal{nullptr};
 
     void *mInputQueueGetEventTarget{nullptr};
     void *mInputQueueGetEventOriginal{nullptr};
