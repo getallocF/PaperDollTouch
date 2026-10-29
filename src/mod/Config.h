@@ -8,20 +8,20 @@
 namespace paperdoll {
 
 struct ModConfig {
-    int version = 2;
+    int version = 3;
     bool enabled = true;
-    float sensitivityYaw = 0.55f;
-    float sensitivityPitch = 0.35f;
+    float sensitivityYaw = 1.0f;
+    float sensitivityPitch = 1.0f;
     bool invertVertical = false;
     float maxPitchDegrees = 45.0f;
     bool resetOnInventoryClose = true;
-    float smoothingFactor = 0.40f;
+    float smoothingFactor = 0.45f;
 
-    // Normalized touch hit-box bounds [0.0, 1.0] covering both Classic & Pocket inventory character panels
-    float boundsMinX = 0.04f;
-    float boundsMinY = 0.06f;
-    float boundsMaxX = 0.68f;
-    float boundsMaxY = 0.82f;
+    // Normalized touch bounds [0.0, 1.0] (full inventory screen active in Cursor-Follow v3)
+    float boundsMinX = 0.0f;
+    float boundsMinY = 0.0f;
+    float boundsMaxX = 1.0f;
+    float boundsMaxY = 1.0f;
 
     // Target Minecraft Bedrock version and runtime RTTI vtable / symbol resolution settings
     std::string expectedMinecraftVersion = "26.60";
@@ -49,19 +49,19 @@ nlohmann::json makeConfigSchemaJson();
 template <> struct pl::config::Schema<paperdoll::ModConfig> {
     static constexpr std::string_view title = "PaperDollTouch Config";
     static constexpr std::string_view description =
-        "Configuration for PaperDollTouch inventory character touch rotation on Minecraft Bedrock 26.60 ARM64.";
+        "Configuration for PaperDollTouch inventory cursor-follow character look on Minecraft Bedrock 26.60 ARM64.";
 
     static constexpr FieldSchema field(std::string_view name) {
         if (name == "version")
             return {.title = "Config Version", .readOnly = true};
         if (name == "enabled")
-            return {.title = "Enabled", .description = "Enable touch-drag rotation on the inventory paper doll preview."};
+            return {.title = "Enabled", .description = "Enable cursor-follow touch tracking on the inventory paper doll preview."};
         if (name == "sensitivityYaw")
-            return {.title = "Horizontal Yaw Sensitivity", .description = "Degrees of horizontal rotation per pixel dragged."};
+            return {.title = "Horizontal Look Sensitivity", .description = "Multiplier for horizontal head & body cursor-follow angle."};
         if (name == "sensitivityPitch")
-            return {.title = "Vertical Pitch Sensitivity", .description = "Degrees of vertical head pitch per pixel dragged."};
+            return {.title = "Vertical Pitch Sensitivity", .description = "Multiplier for vertical head pitch cursor-follow angle."};
         if (name == "invertVertical")
-            return {.title = "Invert Vertical Drag", .description = "Invert vertical drag direction for pitch control."};
+            return {.title = "Invert Vertical Look", .description = "Invert vertical look direction for pitch control."};
         if (name == "maxPitchDegrees")
             return {.title = "Max Pitch Degrees", .description = "Maximum vertical pitch clamp angle in degrees (0 to 85)."};
         if (name == "resetOnInventoryClose")
@@ -69,13 +69,13 @@ template <> struct pl::config::Schema<paperdoll::ModConfig> {
         if (name == "smoothingFactor")
             return {.title = "Smoothing Factor", .description = "Exponential interpolation factor per frame (0.05 = smooth, 1.0 = instant)."};
         if (name == "boundsMinX")
-            return {.title = "Preview Bounds Min X", .description = "Normalized left boundary [0.0-1.0] of the inventory paper doll area."};
+            return {.title = "Preview Bounds Min X", .description = "Normalized left boundary [0.0-1.0] of the active touch area."};
         if (name == "boundsMinY")
-            return {.title = "Preview Bounds Min Y", .description = "Normalized top boundary [0.0-1.0] of the inventory paper doll area."};
+            return {.title = "Preview Bounds Min Y", .description = "Normalized top boundary [0.0-1.0] of the active touch area."};
         if (name == "boundsMaxX")
-            return {.title = "Preview Bounds Max X", .description = "Normalized right boundary [0.0-1.0] of the inventory paper doll area."};
+            return {.title = "Preview Bounds Max X", .description = "Normalized right boundary [0.0-1.0] of the active touch area."};
         if (name == "boundsMaxY")
-            return {.title = "Preview Bounds Max Y", .description = "Normalized bottom boundary [0.0-1.0] of the inventory paper doll area."};
+            return {.title = "Preview Bounds Max Y", .description = "Normalized bottom boundary [0.0-1.0] of the active touch area."};
         if (name == "expectedMinecraftVersion")
             return {.title = "Expected Minecraft Version", .description = "Target Minecraft Bedrock version string (26.60)."};
         if (name == "allowSymbolAutoProbe")

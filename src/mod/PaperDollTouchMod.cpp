@@ -74,7 +74,11 @@ using MobGetInterpolatedRotFn = float (*)(const void *self, float partialTicks);
 using AInputQueueGetEventFn = int32_t (*)(void *queue, void **outEvent);
 
 // Timeout (ms) since last LivePlayerRenderer / PaperDollRenderer render call to consider Inventory open
-constexpr std::int64_t kInventoryRenderTimeoutMs = 220;
+constexpr std::int64_t kInventoryRenderTimeoutMs = 250;
+
+// Normalized screen position of the Paper Doll eye/chest center in Inventory UI
+constexpr float kPaperDollAnchorX = 0.28f;
+constexpr float kPaperDollAnchorY = 0.34f;
 
 bool isValidRotationFloat(float val) noexcept {
     return std::isfinite(val) && std::fabs(val) <= 36000.0f;
@@ -169,19 +173,19 @@ std::int64_t PaperDollTouchMod::monotonicMillis() noexcept {
 }
 
 void PaperDollTouchMod::sanitizeAndApplyConfig() noexcept {
-    // Automatically migrate narrow v1 hit-box bounds to v2 full-inventory character bounds
-    if (mConfig.version < 2 ||
-        (mConfig.boundsMinX >= 0.20f && mConfig.boundsMaxX <= 0.46f)) {
-        mConfig.version = 2;
-        mConfig.boundsMinX = 0.04f;
-        mConfig.boundsMinY = 0.06f;
-        mConfig.boundsMaxX = 0.68f;
-        mConfig.boundsMaxY = 0.82f;
-        if (mConfig.sensitivityYaw < 0.50f)
-            mConfig.sensitivityYaw = 0.55f;
+    // Automatically migrate v1/v2 turntable configs to v3 full-screen Cursor-Follow mode
+    if (mConfig.version < 3) {
+        mConfig.version = 3;
+        mConfig.boundsMinX = 0.0f;
+        mConfig.boundsMinY = 0.0f;
+        mConfig.boundsMaxX = 1.0f;
+        mConfig.boundsMaxY = 1.0f;
+        mConfig.sensitivityYaw = 1.0f;
+        mConfig.sensitivityPitch = 1.0f;
+        mConfig.smoothingFactor = 0.45f;
     }
 
-    mConfig.sensitivityYaw = std::clamp(mConfig.sensitivityYaw, 0.05f, 5.0f);
+    mConfig.sensitivityYaw = std::clamp(mConfig.sensitivityYaw, 0.1f, 5.0f);
     mConfig.sensitivityPitch = std::clamp(mConfig.sensitivityPitch, 0.0f, 5.0f);
     mConfig.maxPitchDegrees = std::clamp(mConfig.maxPitchDegrees, 0.0f, 85.0f);
     mConfig.smoothingFactor = std::clamp(mConfig.smoothingFactor, 0.05f, 1.0f);
@@ -199,7 +203,7 @@ void PaperDollTouchMod::sanitizeAndApplyConfig() noexcept {
 
 bool PaperDollTouchMod::load() {
     auto &self = getSelf();
-    self.getLogger().info("Loading PaperDollTouch v1.1.0 (RTTI Vtable Engine) for Minecraft Bedrock {} (arm64-v8a)...",
+    self.getLogger().info("Loading PaperDollTouch v1.2.0 (Cursor-Follow Engine) for Minecraft Bedrock {} (arm64-v8a)...",
                           mConfig.expectedMinecraftVersion);
 
     std::error_code ec;
@@ -246,7 +250,8 @@ void PaperDollTouchMod::writeDiagnosticProbeReport(
 
     nlohmann::json report = {
         {"mod", "PaperDollTouch"},
-        {"version", "1.1.0"},
+        {"version", "1.2.0"},
+        {"mode", "cursor_follow"},
         {"targetMinecraftVersion", mConfig.expectedMinecraftVersion},
         {"hookInstalled", hookReady},
         {"livePlayerRendererResolved", mLivePlayerRenderTarget != nullptr},
@@ -591,7 +596,7 @@ bool PaperDollTouchMod::enable() {
 
     mState.modActive.store(true, std::memory_order_release);
     self.getLogger().info(
-        "PaperDollTouch v1.1.0 enabled (Renderer Hooks: {}, Input Handlers: plInput={}, AInputQueue={}).",
+        "PaperDollTouch v1.2.0 (Cursor-Follow) enabled (Renderer Hooks: {}, Input Handlers: plInput={}, AInputQueue={}).",
         mState.hookInstalled.load(std::memory_order_acquire) ? "ACTIVE" : "STANDBY",
         mPlInputCallbackRegistered,
         mInputQueueHookInstalled
@@ -618,9 +623,11 @@ void PaperDollTouchMod::resetTouchAndOrientation(bool clearAngles) noexcept {
     mState.lastTouchX.store(0.0f, std::memory_order_relaxed);
     mState.lastTouchY.store(0.0f, std::memory_order_relaxed);
     if (clearAngles) {
-        mState.targetYawOffset.store(0.0f, std::memory_order_relaxed);
+        mState.targetBodyYawOffset.store(0.0f, std::memory_order_relaxed);
+        mState.targetHeadYawOffset.store(0.0f, std::memory_order_relaxed);
         mState.targetPitchOffset.store(0.0f, std::memory_order_relaxed);
-        mState.currentYawOffset.store(0.0f, std::memory_order_relaxed);
+        mState.currentBodyYawOffset.store(0.0f, std::memory_order_relaxed);
+        mState.currentHeadYawOffset.store(0.0f, std::memory_order_relaxed);
         mState.currentPitchOffset.store(0.0f, std::memory_order_relaxed);
     }
 }
@@ -629,8 +636,8 @@ bool PaperDollTouchMod::isPointInsidePreviewBounds(float x, float y) const noexc
     const float sw = std::max(1.0f, mState.screenWidth.load(std::memory_order_relaxed));
     const float sh = std::max(1.0f, mState.screenHeight.load(std::memory_order_relaxed));
 
-    const float nx = x / sw;
-    const float ny = y / sh;
+    const float nx = std::clamp(x / sw, 0.0f, 1.0f);
+    const float ny = std::clamp(y / sh, 0.0f, 1.0f);
 
     const float minX = mState.activeBoundsMinX.load(std::memory_order_relaxed);
     const float minY = mState.activeBoundsMinY.load(std::memory_order_relaxed);
@@ -638,6 +645,36 @@ bool PaperDollTouchMod::isPointInsidePreviewBounds(float x, float y) const noexc
     const float maxY = mState.activeBoundsMaxY.load(std::memory_order_relaxed);
 
     return (nx >= minX && nx <= maxX && ny >= minY && ny <= maxY);
+}
+
+void PaperDollTouchMod::updateCursorFollowTargets(float x, float y) noexcept {
+    const float sw = std::max(1.0f, mState.screenWidth.load(std::memory_order_relaxed));
+    const float sh = std::max(1.0f, mState.screenHeight.load(std::memory_order_relaxed));
+
+    const float nx = std::clamp(x / sw, 0.0f, 1.0f);
+    const float ny = std::clamp(y / sh, 0.0f, 1.0f);
+
+    // Offset from the Paper Doll's eye/chest center in Inventory UI
+    const float dx = nx - kPaperDollAnchorX;
+    const float dy = ny - kPaperDollAnchorY;
+
+    // Authentic Minecraft PC InventoryScreen atan cursor-look curve:
+    // atan(delta * scale) provides responsive tracking near the doll and natural saturation at screen edges
+    const float atanX = std::atan(dx * 3.8f);
+    const float atanY = std::atan(dy * 3.8f);
+
+    // Body turns partially (~26 deg) while Head turns fully (~54 deg) toward the touch cursor,
+    // creating natural neck rotation + chest angling just like the PC mouse cursor in Inventory!
+    const float bodyYaw = -atanX * (26.0f * mConfig.sensitivityYaw);
+    const float headYaw = -atanX * (54.0f * mConfig.sensitivityYaw);
+
+    const float pitchSign = mConfig.invertVertical ? -1.0f : 1.0f;
+    const float rawPitch = (atanY * pitchSign) * (34.0f * mConfig.sensitivityPitch);
+    const float pitch = std::clamp(rawPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
+
+    mState.targetBodyYawOffset.store(bodyYaw, std::memory_order_relaxed);
+    mState.targetHeadYawOffset.store(headYaw, std::memory_order_relaxed);
+    mState.targetPitchOffset.store(pitch, std::memory_order_relaxed);
 }
 
 int32_t PaperDollTouchMod::onInputQueueGetEventDetour(void *queue, void **outEvent) noexcept {
@@ -697,15 +734,29 @@ bool PaperDollTouchMod::onTouchEvent(int action, int pointerId, float x, float y
     mState.lastRawEventX.store(x, std::memory_order_relaxed);
     mState.lastRawEventY.store(y, std::memory_order_relaxed);
 
-    // Opportunistically calibrate physical screen dimensions without syscalls
+    // Opportunistically calibrate physical screen dimensions from any touch on screen
     float currentSw = mState.screenWidth.load(std::memory_order_relaxed);
     float currentSh = mState.screenHeight.load(std::memory_order_relaxed);
-    if (x > currentSw && x < 16384.0f)
-        mState.screenWidth.store(x, std::memory_order_relaxed);
-    if (y > currentSh && y < 16384.0f)
-        mState.screenHeight.store(y, std::memory_order_relaxed);
+    if (y > 740.0f && currentSh < 1080.0f) {
+        currentSh = 1080.0f;
+        currentSw = std::max(currentSw, 2160.0f);
+        mState.screenHeight.store(currentSh, std::memory_order_relaxed);
+        mState.screenWidth.store(currentSw, std::memory_order_relaxed);
+    }
+    if (y > 1100.0f && currentSh < 1440.0f) {
+        currentSh = 1440.0f;
+        currentSw = std::max(currentSw, 2880.0f);
+        mState.screenHeight.store(currentSh, std::memory_order_relaxed);
+        mState.screenWidth.store(currentSw, std::memory_order_relaxed);
+    }
+    if (x > currentSw && x < 16384.0f) {
+        mState.screenWidth.store(x * 1.02f, std::memory_order_relaxed);
+    }
+    if (y > currentSh && y < 16384.0f) {
+        mState.screenHeight.store(y * 1.02f, std::memory_order_relaxed);
+    }
 
-    // Check if the inventory paper doll was rendered within the last 220 ms
+    // Check if the inventory paper doll was rendered within the last 250 ms
     const std::int64_t lastRenderMs = mState.lastInventoryRenderMs.load(std::memory_order_acquire);
     const bool inventoryOpen = (lastRenderMs > 0) && ((nowMs - lastRenderMs) <= kInventoryRenderTimeoutMs);
 
@@ -716,45 +767,29 @@ bool PaperDollTouchMod::onTouchEvent(int action, int pointerId, float x, float y
         return false;
     }
 
-    const int trackedPointer = mState.activePointerId.load(std::memory_order_relaxed);
-
     switch (maskedAction) {
     case AMOTION_EVENT_ACTION_DOWN:
     case AMOTION_EVENT_ACTION_POINTER_DOWN: {
-        // Lock pointerId if no pointer is active AND touch starts inside the character preview bounds
-        if (trackedPointer == -1 && isPointInsidePreviewBounds(x, y)) {
+        if (isPointInsidePreviewBounds(x, y)) {
             mState.activePointerId.store(pointerId, std::memory_order_relaxed);
             mState.lastTouchX.store(x, std::memory_order_relaxed);
             mState.lastTouchY.store(y, std::memory_order_relaxed);
+            // Immediately point the Paper Doll toward the touched screen location like a PC cursor
+            updateCursorFollowTargets(x, y);
         }
         break;
     }
 
     case AMOTION_EVENT_ACTION_MOVE: {
-        if (trackedPointer != -1 && pointerId == trackedPointer) {
-            const float prevX = mState.lastTouchX.load(std::memory_order_relaxed);
-            const float prevY = mState.lastTouchY.load(std::memory_order_relaxed);
-
-            const float deltaX = x - prevX;
-            const float deltaY = y - prevY;
-
+        const int trackedPointer = mState.activePointerId.load(std::memory_order_relaxed);
+        if (trackedPointer == -1 || pointerId == trackedPointer) {
+            if (trackedPointer == -1) {
+                mState.activePointerId.store(pointerId, std::memory_order_relaxed);
+            }
             mState.lastTouchX.store(x, std::memory_order_relaxed);
             mState.lastTouchY.store(y, std::memory_order_relaxed);
-
-            if (std::fabs(deltaX) > 0.15f || std::fabs(deltaY) > 0.15f) {
-                float yaw = mState.targetYawOffset.load(std::memory_order_relaxed);
-                float pitch = mState.targetPitchOffset.load(std::memory_order_relaxed);
-
-                yaw -= deltaX * mConfig.sensitivityYaw;
-                yaw = std::remainder(yaw, 360.0f);
-
-                const float pitchSign = mConfig.invertVertical ? -1.0f : 1.0f;
-                pitch += (deltaY * pitchSign) * mConfig.sensitivityPitch;
-                pitch = std::clamp(pitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
-
-                mState.targetYawOffset.store(yaw, std::memory_order_relaxed);
-                mState.targetPitchOffset.store(pitch, std::memory_order_relaxed);
-            }
+            // Continuously track finger position across the entire Inventory screen like a cursor
+            updateCursorFollowTargets(x, y);
         }
         break;
     }
@@ -762,6 +797,7 @@ bool PaperDollTouchMod::onTouchEvent(int action, int pointerId, float x, float y
     case AMOTION_EVENT_ACTION_UP:
     case AMOTION_EVENT_ACTION_POINTER_UP:
     case AMOTION_EVENT_ACTION_CANCEL: {
+        const int trackedPointer = mState.activePointerId.load(std::memory_order_relaxed);
         if (trackedPointer != -1 && pointerId == trackedPointer) {
             mState.activePointerId.store(-1, std::memory_order_relaxed);
         }
@@ -781,48 +817,22 @@ void PaperDollTouchMod::stepOrientationSmoothing() noexcept {
     mState.inventoryPreviewVisible.store(true, std::memory_order_release);
     mState.renderedPreviewFrames.fetch_add(1, std::memory_order_relaxed);
 
-    const float targetYaw = mState.targetYawOffset.load(std::memory_order_relaxed);
+    const float targetBodyYaw = mState.targetBodyYawOffset.load(std::memory_order_relaxed);
+    const float targetHeadYaw = mState.targetHeadYawOffset.load(std::memory_order_relaxed);
     const float targetPitch = mState.targetPitchOffset.load(std::memory_order_relaxed);
-    float curYaw = mState.currentYawOffset.load(std::memory_order_relaxed);
+
+    float curBodyYaw = mState.currentBodyYawOffset.load(std::memory_order_relaxed);
+    float curHeadYaw = mState.currentHeadYawOffset.load(std::memory_order_relaxed);
     float curPitch = mState.currentPitchOffset.load(std::memory_order_relaxed);
 
     const float alpha = mConfig.smoothingFactor;
-    curYaw += (targetYaw - curYaw) * alpha;
+    curBodyYaw += (targetBodyYaw - curBodyYaw) * alpha;
+    curHeadYaw += (targetHeadYaw - curHeadYaw) * alpha;
     curPitch += (targetPitch - curPitch) * alpha;
 
-    mState.currentYawOffset.store(curYaw, std::memory_order_relaxed);
+    mState.currentBodyYawOffset.store(curBodyYaw, std::memory_order_relaxed);
+    mState.currentHeadYawOffset.store(curHeadYaw, std::memory_order_relaxed);
     mState.currentPitchOffset.store(curPitch, std::memory_order_relaxed);
-}
-
-void PaperDollTouchMod::applyPaperDollRendererFields(void *paperDollRenderer) noexcept {
-    if (paperDollRenderer == nullptr)
-        return;
-
-    const float curYaw = mState.currentYawOffset.load(std::memory_order_relaxed);
-    const float curPitch = mState.currentPitchOffset.load(std::memory_order_relaxed);
-    if (std::fabs(curYaw) < 0.01f && std::fabs(curPitch) < 0.01f)
-        return;
-
-    // PaperDollRenderer POD field layout (64-bit ARM64):
-    // +0x0C: int mRotationStyle (CustomY = 3)
-    // +0x20: float mRotation
-    // +0x24: float mTargetRotation
-    // +0x28: float mCameraTiltInDeg
-    auto *base = static_cast<std::uint8_t *>(paperDollRenderer);
-    auto *rotStyle = reinterpret_cast<int *>(base + 0x0C);
-    auto *rot = reinterpret_cast<float *>(base + 0x20);
-    auto *targetRot = reinterpret_cast<float *>(base + 0x24);
-    auto *tilt = reinterpret_cast<float *>(base + 0x28);
-
-    if (*rotStyle >= 0 && *rotStyle <= 6 &&
-        isValidRotationFloat(*rot) &&
-        isValidRotationFloat(*targetRot) &&
-        isValidRotationFloat(*tilt)) {
-        *rotStyle = 3; // CustomY
-        *rot += curYaw;
-        *targetRot = *rot;
-        *tilt = std::clamp(*tilt + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
-    }
 }
 
 void PaperDollTouchMod::onLivePlayerRenderDetour(
@@ -863,7 +873,6 @@ void PaperDollTouchMod::onPaperDollRenderDetour(
     }
 
     stepOrientationSmoothing();
-    applyPaperDollRendererFields(self);
     ScopedInventoryPass passGuard(mState.inInventoryRenderPass);
     originalFn(self, renderContext, clientInstance, uiControl, pass);
 }
@@ -885,10 +894,11 @@ void PaperDollTouchMod::onPaperDollRenderGuiDetour(
         return;
     }
 
-    const float curYaw = mState.currentYawOffset.load(std::memory_order_relaxed);
+    const float curBodyYaw = mState.currentBodyYawOffset.load(std::memory_order_relaxed);
+    const float curHeadYaw = mState.currentHeadYawOffset.load(std::memory_order_relaxed);
     const float curPitch = mState.currentPitchOffset.load(std::memory_order_relaxed);
 
-    if (std::fabs(curYaw) < 0.01f && std::fabs(curPitch) < 0.01f) {
+    if (std::fabs(curHeadYaw) < 0.01f && std::fabs(curPitch) < 0.01f) {
         originalFn(self, rendererName, actorRenderData, captureDesc);
         return;
     }
@@ -900,11 +910,13 @@ void PaperDollTouchMod::onPaperDollRenderGuiDetour(
 
     if (isValidRotationFloat(savedPitch) && isValidRotationFloat(savedYaw)) {
         actorRenderData->rotPitch = std::clamp(savedPitch + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
-        actorRenderData->rotYaw = savedYaw + curYaw;
+        if (mMobBodyRotTarget == nullptr) {
+            actorRenderData->rotYaw = savedYaw + curBodyYaw;
+        }
         if (isValidRotationFloat(savedHeadPitch))
             actorRenderData->headRotPitch = std::clamp(savedHeadPitch + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
-        if (isValidRotationFloat(savedHeadYaw))
-            actorRenderData->headRotYaw = savedHeadYaw + curYaw;
+        if (isValidRotationFloat(savedHeadYaw) && mMobHeadRotTarget == nullptr)
+            actorRenderData->headRotYaw = savedHeadYaw + curHeadYaw;
     }
 
     originalFn(self, rendererName, actorRenderData, captureDesc);
@@ -924,7 +936,7 @@ void PaperDollTouchMod::onDataDrivenRenderDetour(
     if (originalFn == nullptr)
         return;
 
-    // Only apply rotation override during LivePlayerRenderer::render or PaperDollRenderer::render
+    // Only apply cursor-follow look during LivePlayerRenderer::render or PaperDollRenderer::render
     if (!mState.modActive.load(std::memory_order_acquire) ||
         !mState.inInventoryRenderPass.load(std::memory_order_acquire) ||
         actorRenderData == nullptr) {
@@ -932,10 +944,11 @@ void PaperDollTouchMod::onDataDrivenRenderDetour(
         return;
     }
 
-    const float curYaw = mState.currentYawOffset.load(std::memory_order_relaxed);
+    const float curBodyYaw = mState.currentBodyYawOffset.load(std::memory_order_relaxed);
+    const float curHeadYaw = mState.currentHeadYawOffset.load(std::memory_order_relaxed);
     const float curPitch = mState.currentPitchOffset.load(std::memory_order_relaxed);
 
-    if (std::fabs(curYaw) < 0.01f && std::fabs(curPitch) < 0.01f) {
+    if (std::fabs(curHeadYaw) < 0.01f && std::fabs(curPitch) < 0.01f) {
         originalFn(self, baseActorRenderContext, actorRenderData);
         return;
     }
@@ -945,8 +958,9 @@ void PaperDollTouchMod::onDataDrivenRenderDetour(
     const float savedHeadPitch = actorRenderData->headRotPitch;
     const float savedHeadYaw = actorRenderData->headRotYaw;
 
-    // Also locate ActorRotationComponent (float mPitch, mYaw, mOldPitch, mOldYaw) inside mActor's BuiltInActorComponents
-    // so Molang queries (query.head_x_rotation, query.head_y_rotation, query.body_y_rotation) rotate in tandem.
+    // Locate ActorRotationComponent (float mPitch, mYaw, mOldPitch, mOldYaw) inside mActor's BuiltInActorComponents
+    // so Molang queries (query.head_x_rotation for vertical pitch, query.head_y_rotation for horizontal head turn)
+    // evaluate with our exact cursor-follow pitch and head yaw!
     float *actorRotCompFloats = nullptr;
     float savedCompFloats[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -955,6 +969,8 @@ void PaperDollTouchMod::onDataDrivenRenderDetour(
         isValidRotationFloat(savedYaw)) {
         auto *actorBytes = static_cast<std::uint8_t *>(actorRenderData->mActor);
         const std::uintptr_t actorAddr = reinterpret_cast<std::uintptr_t>(actorBytes);
+        const float expectedOrigYaw = (mMobBodyRotTarget != nullptr) ? (savedYaw - curBodyYaw) : savedYaw;
+
         // BuiltInActorComponents is embedded inside Actor within +0x18..+0x98
         for (std::size_t off = 0x18; off <= 0x98; off += sizeof(void *)) {
             void *candPtr = *reinterpret_cast<void **>(actorBytes + off);
@@ -963,16 +979,18 @@ void PaperDollTouchMod::onDataDrivenRenderDetour(
                 std::llabs(static_cast<long long>(candAddr) - static_cast<long long>(actorAddr)) < 0x40000000LL) {
                 auto *f = static_cast<float *>(candPtr);
                 if (std::isfinite(f[0]) && std::isfinite(f[1]) &&
-                    std::fabs(f[0] - savedPitch) < 0.05f &&
-                    std::fabs(f[1] - savedYaw) < 0.05f &&
-                    isValidRotationFloat(f[2]) && isValidRotationFloat(f[3])) {
+                    isValidRotationFloat(f[2]) && isValidRotationFloat(f[3]) &&
+                    std::fabs(f[0] - savedPitch) < 0.5f &&
+                    std::fabs(f[0] - f[2]) < 0.5f &&
+                    std::fabs(f[1] - f[3]) < 0.5f &&
+                    (std::fabs(f[1] - expectedOrigYaw) < 1.0f || std::fabs(f[1] - savedYaw) < 1.0f)) {
                     actorRotCompFloats = f;
                     savedCompFloats[0] = f[0];
                     savedCompFloats[1] = f[1];
                     savedCompFloats[2] = f[2];
                     savedCompFloats[3] = f[3];
                     const float newCompPitch = std::clamp(savedCompFloats[0] + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
-                    const float newCompYaw = savedCompFloats[1] + curYaw;
+                    const float newCompYaw = savedCompFloats[1] + curHeadYaw;
                     f[0] = newCompPitch;
                     f[1] = newCompYaw;
                     f[2] = newCompPitch;
@@ -985,11 +1003,13 @@ void PaperDollTouchMod::onDataDrivenRenderDetour(
 
     if (isValidRotationFloat(savedPitch) && isValidRotationFloat(savedYaw)) {
         actorRenderData->rotPitch = std::clamp(savedPitch + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
-        actorRenderData->rotYaw = savedYaw + curYaw;
+        if (mMobBodyRotTarget == nullptr) {
+            actorRenderData->rotYaw = savedYaw + curBodyYaw;
+        }
         if (isValidRotationFloat(savedHeadPitch))
             actorRenderData->headRotPitch = std::clamp(savedHeadPitch + curPitch, -mConfig.maxPitchDegrees, mConfig.maxPitchDegrees);
-        if (isValidRotationFloat(savedHeadYaw))
-            actorRenderData->headRotYaw = savedHeadYaw + curYaw;
+        if (isValidRotationFloat(savedHeadYaw) && mMobHeadRotTarget == nullptr)
+            actorRenderData->headRotYaw = savedHeadYaw + curHeadYaw;
     }
 
     originalFn(self, baseActorRenderContext, actorRenderData);
@@ -1015,7 +1035,7 @@ float PaperDollTouchMod::onMobGetInterpolatedBodyRotDetour(const void *self, flo
     const float val = originalFn(self, partialTicks);
     if (mState.modActive.load(std::memory_order_acquire) &&
         mState.inInventoryRenderPass.load(std::memory_order_acquire)) {
-        return val + mState.currentYawOffset.load(std::memory_order_relaxed);
+        return val + mState.currentBodyYawOffset.load(std::memory_order_relaxed);
     }
     return val;
 }
@@ -1028,7 +1048,7 @@ float PaperDollTouchMod::onMobGetInterpolatedHeadRotDetour(const void *self, flo
     const float val = originalFn(self, partialTicks);
     if (mState.modActive.load(std::memory_order_acquire) &&
         mState.inInventoryRenderPass.load(std::memory_order_acquire)) {
-        return val + mState.currentYawOffset.load(std::memory_order_relaxed);
+        return val + mState.currentHeadYawOffset.load(std::memory_order_relaxed);
     }
     return val;
 }
@@ -1041,7 +1061,7 @@ float PaperDollTouchMod::onMobGetInterpolatedBodyYawDetour(const void *self, flo
     const float val = originalFn(self, partialTicks);
     if (mState.modActive.load(std::memory_order_acquire) &&
         mState.inInventoryRenderPass.load(std::memory_order_acquire)) {
-        return val + mState.currentYawOffset.load(std::memory_order_relaxed);
+        return val + mState.currentBodyYawOffset.load(std::memory_order_relaxed);
     }
     return val;
 }

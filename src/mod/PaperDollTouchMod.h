@@ -49,25 +49,29 @@ struct RuntimeTouchState {
     std::atomic<float> lastRawEventX{-1.0f};
     std::atomic<float> lastRawEventY{-1.0f};
 
-    // Active touch pointer ID locked ONLY when ACTION_DOWN starts inside paper doll preview bounds
+    // Active touch pointer ID and virtual cursor coordinates
     std::atomic<std::int32_t> activePointerId{-1};
     std::atomic<float> lastTouchX{0.0f};
     std::atomic<float> lastTouchY{0.0f};
 
-    // Calibrated physical screen dimensions (pixels) - starts at 1280x720 and expands dynamically
-    std::atomic<float> screenWidth{1280.0f};
-    std::atomic<float> screenHeight{720.0f};
+    // Calibrated physical screen dimensions (pixels) - starts at 1920x1080 and self-calibrates
+    std::atomic<float> screenWidth{1920.0f};
+    std::atomic<float> screenHeight{1080.0f};
 
-    // Normalized [0.0, 1.0] active preview hit-box bounds
-    std::atomic<float> activeBoundsMinX{0.04f};
-    std::atomic<float> activeBoundsMinY{0.06f};
-    std::atomic<float> activeBoundsMaxX{0.68f};
-    std::atomic<float> activeBoundsMaxY{0.82f};
+    // Normalized [0.0, 1.0] active touch bounds
+    std::atomic<float> activeBoundsMinX{0.0f};
+    std::atomic<float> activeBoundsMinY{0.0f};
+    std::atomic<float> activeBoundsMaxX{1.0f};
+    std::atomic<float> activeBoundsMaxY{1.0f};
 
-    // Target and smoothed orientation deltas (degrees)
-    std::atomic<float> targetYawOffset{0.0f};
+    // Cursor-Follow target and smoothed orientation deltas (degrees)
+    // Decouples Body Yaw (~26 deg) from Head Yaw (~54 deg) and Head Pitch (~34 deg)
+    // so the character's head and eyes track the finger like a PC mouse cursor.
+    std::atomic<float> targetBodyYawOffset{0.0f};
+    std::atomic<float> targetHeadYawOffset{0.0f};
     std::atomic<float> targetPitchOffset{0.0f};
-    std::atomic<float> currentYawOffset{0.0f};
+    std::atomic<float> currentBodyYawOffset{0.0f};
+    std::atomic<float> currentHeadYawOffset{0.0f};
     std::atomic<float> currentPitchOffset{0.0f};
 
     // Diagnostic counter of rendered inventory preview frames
@@ -141,8 +145,8 @@ class PaperDollTouchMod {
     void registerInputHandlers() noexcept;
     void removeHooks() noexcept;
     void resetTouchAndOrientation(bool clearAngles) noexcept;
+    void updateCursorFollowTargets(float x, float y) noexcept;
     void stepOrientationSmoothing() noexcept;
-    void applyPaperDollRendererFields(void *paperDollRenderer) noexcept;
     bool isPointInsidePreviewBounds(float x, float y) const noexcept;
     void writeDiagnosticProbeReport(
         bool hookReady,
