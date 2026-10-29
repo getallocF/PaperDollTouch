@@ -290,14 +290,18 @@ bool PaperDollTouchMod::tryResolveAndInstallHooks() noexcept {
 
 #if PDT_HAS_PL_VTABLE
     if (mConfig.allowSymbolAutoProbe) {
+        auto resolveMcVtable = [](std::string_view typeInfoName, std::size_t slot) noexcept -> std::uintptr_t {
+            return pl::memory::resolveVtableFunction(typeInfoName, slot, "libminecraftpe.so");
+        };
+
         // 1. Resolve LivePlayerRenderer::render and PaperDollRenderer::render via RTTI Vtable
         // Default slot in MinecraftUICustomRenderer is 17; scan 17 first, then fallback 14..22
         constexpr std::array<std::size_t, 9> kUiRenderSlotOrder = {17, 16, 18, 15, 19, 14, 20, 21, 22};
         for (std::size_t slot : kUiRenderSlotOrder) {
-            const std::uintptr_t candLive = pl::memory::resolveVtableFunction("18LivePlayerRenderer", slot);
-            const std::uintptr_t candHud = pl::memory::resolveVtableFunction("17HudPlayerRenderer", slot);
-            const std::uintptr_t candPaper = pl::memory::resolveVtableFunction("17PaperDollRenderer", slot);
-            const std::uintptr_t candBase = pl::memory::resolveVtableFunction("25MinecraftUICustomRenderer", slot);
+            const std::uintptr_t candLive = resolveMcVtable("18LivePlayerRenderer", slot);
+            const std::uintptr_t candHud = resolveMcVtable("17HudPlayerRenderer", slot);
+            const std::uintptr_t candPaper = resolveMcVtable("17PaperDollRenderer", slot);
+            const std::uintptr_t candBase = resolveMcVtable("25MinecraftUICustomRenderer", slot);
 
             if (candLive != 0 && candHud != 0 && candLive != candHud && candLive != candBase) {
                 if (liveRenderAddr == 0) {
@@ -314,24 +318,24 @@ bool PaperDollTouchMod::tryResolveAndInstallHooks() noexcept {
 
         // Fallback if 17HudPlayerRenderer RTTI was optimized out
         if (liveRenderAddr == 0) {
-            liveRenderAddr = pl::memory::resolveVtableFunction("18LivePlayerRenderer", 17);
+            liveRenderAddr = resolveMcVtable("18LivePlayerRenderer", 17);
             if (liveRenderAddr != 0)
                 liveSource = "vtable:18LivePlayerRenderer#17";
         }
         if (paperDollRenderAddr == 0) {
-            paperDollRenderAddr = pl::memory::resolveVtableFunction("17PaperDollRenderer", 17);
+            paperDollRenderAddr = resolveMcVtable("17PaperDollRenderer", 17);
             if (paperDollRenderAddr != 0)
                 paperDollSource = "vtable:17PaperDollRenderer#17";
         }
 
         // 2. Resolve PaperDollBaseActorRenderContext::renderGui (slot 6)
-        paperDollRenderGuiAddr = pl::memory::resolveVtableFunction("31PaperDollBaseActorRenderContext", 6);
+        paperDollRenderGuiAddr = resolveMcVtable("31PaperDollBaseActorRenderContext", 6);
 
         // 3. Resolve DataDrivenRenderer::render(BaseActorRenderContext&, ActorRenderData&) (slot 3)
         constexpr std::array<std::size_t, 5> kDataDrivenSlotOrder = {3, 2, 4, 5, 6};
         for (std::size_t slot : kDataDrivenSlotOrder) {
-            const std::uintptr_t candDd = pl::memory::resolveVtableFunction("18DataDrivenRenderer", slot);
-            const std::uintptr_t candBase = pl::memory::resolveVtableFunction("13ActorRenderer", slot);
+            const std::uintptr_t candDd = resolveMcVtable("18DataDrivenRenderer", slot);
+            const std::uintptr_t candBase = resolveMcVtable("13ActorRenderer", slot);
             if (candDd != 0 && candDd != candBase) {
                 dataDrivenRenderAddr = candDd;
                 dataDrivenSource = "vtable:18DataDrivenRenderer#" + std::to_string(slot);
@@ -339,7 +343,7 @@ bool PaperDollTouchMod::tryResolveAndInstallHooks() noexcept {
             }
         }
         if (dataDrivenRenderAddr == 0) {
-            dataDrivenRenderAddr = pl::memory::resolveVtableFunction("18DataDrivenRenderer", 3);
+            dataDrivenRenderAddr = resolveMcVtable("18DataDrivenRenderer", 3);
             if (dataDrivenRenderAddr != 0)
                 dataDrivenSource = "vtable:18DataDrivenRenderer#3";
         }
@@ -348,14 +352,14 @@ bool PaperDollTouchMod::tryResolveAndInstallHooks() noexcept {
         // Verify against 5Actor where slots 12,13 are identical and 14,15,16 are overridden by 3Mob
         bool foundMobSlots = false;
         for (std::size_t baseSlot : {14ULL, 13ULL, 15ULL, 12ULL, 16ULL, 17ULL}) {
-            const std::uintptr_t m0 = pl::memory::resolveVtableFunction("3Mob", baseSlot);
-            const std::uintptr_t m1 = pl::memory::resolveVtableFunction("3Mob", baseSlot + 1);
-            const std::uintptr_t m2 = pl::memory::resolveVtableFunction("3Mob", baseSlot + 2);
-            const std::uintptr_t a0 = pl::memory::resolveVtableFunction("5Actor", baseSlot);
-            const std::uintptr_t a1 = pl::memory::resolveVtableFunction("5Actor", baseSlot + 1);
-            const std::uintptr_t a2 = pl::memory::resolveVtableFunction("5Actor", baseSlot + 2);
-            const std::uintptr_t prevM = baseSlot > 0 ? pl::memory::resolveVtableFunction("3Mob", baseSlot - 1) : 0;
-            const std::uintptr_t prevA = baseSlot > 0 ? pl::memory::resolveVtableFunction("5Actor", baseSlot - 1) : 0;
+            const std::uintptr_t m0 = resolveMcVtable("3Mob", baseSlot);
+            const std::uintptr_t m1 = resolveMcVtable("3Mob", baseSlot + 1);
+            const std::uintptr_t m2 = resolveMcVtable("3Mob", baseSlot + 2);
+            const std::uintptr_t a0 = resolveMcVtable("5Actor", baseSlot);
+            const std::uintptr_t a1 = resolveMcVtable("5Actor", baseSlot + 1);
+            const std::uintptr_t a2 = resolveMcVtable("5Actor", baseSlot + 2);
+            const std::uintptr_t prevM = baseSlot > 0 ? resolveMcVtable("3Mob", baseSlot - 1) : 0;
+            const std::uintptr_t prevA = baseSlot > 0 ? resolveMcVtable("5Actor", baseSlot - 1) : 0;
 
             if (m0 != 0 && m1 != 0 && m2 != 0 &&
                 a0 != 0 && a1 != 0 && a2 != 0 &&
@@ -370,9 +374,9 @@ bool PaperDollTouchMod::tryResolveAndInstallHooks() noexcept {
             }
         }
         if (!foundMobSlots) {
-            mobBodyRotAddr = pl::memory::resolveVtableFunction("3Mob", 14);
-            mobHeadRotAddr = pl::memory::resolveVtableFunction("3Mob", 15);
-            mobBodyYawAddr = pl::memory::resolveVtableFunction("3Mob", 16);
+            mobBodyRotAddr = resolveMcVtable("3Mob", 14);
+            mobHeadRotAddr = resolveMcVtable("3Mob", 15);
+            mobBodyYawAddr = resolveMcVtable("3Mob", 16);
             if (mobBodyRotAddr != 0)
                 mobInterpSource = "vtable:3Mob#14..16";
         }

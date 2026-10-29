@@ -134,7 +134,7 @@ target_include_directories(${MOD_LIBRARY_NAME}
 
 target_compile_options(${MOD_LIBRARY_NAME}
     PRIVATE
-        $<$<COMPILE_LANG_AND_ID:CXX,Clang,GNU>:-fvisibility=hidden -fvisibility-inlines-hidden -O2 -Wall -Wextra>
+        $<$<COMPILE_LANG_AND_ID:CXX,Clang,GNU>:-fvisibility=hidden -fvisibility-inlines-hidden -O2 -Wall -Wextra -Wno-missing-field-initializers>
 )
 
 target_link_options(${MOD_LIBRARY_NAME}
