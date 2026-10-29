@@ -1,14 +1,16 @@
-# PaperDollTouch — Minecraft Bedrock 26.60 (Android ARM64)
+# Minecraft Mobile Cursor — Windows-Style GUI System (PaperDollTouch v2.0.0)
 
-Native mod untuk **LeviLauncher Android** (`preload-native`, `arm64-v8a`) yang memungkinkan pemain memutar preview karakter (paper doll) di layar inventory menggunakan sentuhan dan geseran jari (horizontal yaw & vertical pitch) tanpa mengubah arah pandang pemain di dunia.
+Mod native C++20 (`preload-native`, `arm64-v8a`) untuk **LeviLauncher Android** pada **Minecraft Bedrock 26.60** yang menghadirkan pengalaman **Kursor Minecraft Windows** di perangkat mobile layar sentuh, terintegrasi penuh dengan **PaperDollTouch**.
 
-## Arsitektur Proyek
+## Fitur Utama
 
-Proyek ini dibangun di atas fondasi `levilauncher-android-mod-template` yang telah terbukti berhasil dikompilasi di GitHub Actions (`ndk;28.2.13676358`, CMake + Ninja + `scripts/package.ps1`), dengan seluruh contoh `clange_me` digantikan oleh implementasi C++20 `paperdoll::PaperDollTouchMod`:
-
-- `CMakeLists.txt` — Mengonfigurasi target `PaperDollTouch` (`libPaperDollTouch.so`) dan paket `PaperDollTouch.levipack`.
-- `src/main.cpp` — Registrasi entry point `PL_REGISTER_MOD(paperdoll::PaperDollTouchMod, ...)`.
-- `src/mod/Config.h` & `src/mod/Config.cpp` — Skema konfigurasi terketik (`pl::config::Schema<paperdoll::ModConfig>`).
-- `src/mod/PaperDollTouchMod.h` & `src/mod/PaperDollTouchMod.cpp` — State machine input sentuh lock-free (`std::atomic`), pemindai simbol ELF64 `.dynsym` satu-kali (`dl_iterate_phdr`), dan detour `HudPlayerRenderer::render` dengan *Scoped Save-and-Restore* orientasi karakter.
-
-Baca `BUILD_INSTRUCTIONS.txt` untuk panduan lengkap kompilasi di GitHub Actions dan instalasi di LeviLauncher langsung dari HP Android.
+1. **Kursor Pointer Putih Windows (Hanya Saat GUI Terbuka)**:
+   - Aktif otomatis saat membuka Player Inventory, Chest, Crafting Table, Furnace, Anvil, Villager Trading, Pause Menu, dan Settings.
+   - Langsung menghilang sepenuhnya saat kembali ke gameplay normal (tidak muncul di HUD dan tidak mengganggu kontrol kamera).
+   - Otomatis disembunyikan jika mouse fisik (`AINPUT_SOURCE_MOUSE`) sedang digunakan.
+2. **Green Slot Hover (`#38E54D`)**:
+   - Menampilkan border hijau ala Minecraft Windows tepat pada slot yang sedang ditunjuk kursor tanpa menutupi ikon item, jumlah stack, durability bar, atau tooltip.
+3. **Kepala & Badan Player Mengikuti Kursor (PaperDoll Cursor-Follow)**:
+   - Mengintegrasikan perbaikan vtable `3Mob` (slot 14 & 16) + `5Actor::getInterpolatedHeadRot` (slot 15) + `ActorRotationComponent` (TBI-safe) sehingga kepala, leher, dan badan Paper Doll menoleh serta mendongak/menunduk mengikuti kursor.
+4. **Menu Pengaturan `Mobile Cursor Settings`**:
+   - Klik tombol **`[Cursor]`** di pojok kanan atas saat membuka Inventory/Pause Menu untuk memilih ukuran **Small (`0.75×`)**, **Medium (`1.00×` bawaan)**, **Large (`1.50×`)**, atau menggeser slider **`0.75× – 2.00×`** secara langsung tanpa restart game.

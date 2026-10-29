@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -17,6 +18,14 @@ struct McVec2 {
     float y{0.0f};
 };
 
+// Screen-space slot rectangle detected from UIControl / InventoryItemRenderer (zero heap allocation)
+struct DetectedSlotRect {
+    float x{0.0f};
+    float y{0.0f};
+    float w{0.0f};
+    float h{0.0f};
+};
+
 // Minecraft Bedrock ActorRenderData layout prefix (64-bit ARM64, STL-free POD prefix)
 struct McActorRenderDataPrefix {
     void *mActor{nullptr};           // +0x00 (Actor*)
@@ -32,21 +41,39 @@ struct McActorRenderDataPrefix {
     bool mIsInUI{false};             // +0x26
 };
 
-// Lock-free atomic runtime state shared between Input Thread and RenderDragon UI Thread
+// Lock-free atomic runtime state shared between Input Thread and RenderDragon UI/EGL Thread
 struct RuntimeTouchState {
     std::atomic<bool> modActive{false};
     std::atomic<bool> hookInstalled{false};
+    std::atomic<bool> guiScreenOpen{false};
     std::atomic<bool> inventoryPreviewVisible{false};
     std::atomic<bool> inInventoryRenderPass{false};
     std::atomic<bool> bodyRotGetterCalledThisPass{false};
     std::atomic<bool> headRotGetterCalledThisPass{false};
+    std::atomic<bool> physicalMouseActive{false};
+    std::atomic<bool> settingsMenuOpen{false};
 
     // Saved ActorRotationComponent pointer & values during active UI render pass
     float *activeActorRotCompFloats{nullptr};
     float savedActorRotCompFloats[4]{0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Monotonic timestamp (ms) of the most recent Inventory LivePlayerRenderer / PaperDollRenderer render call
+    // Monotonic timestamps (ms) for GUI lifecycle & PaperDoll visibility detection
+    std::atomic<std::int64_t> lastGuiRenderMs{0};
     std::atomic<std::int64_t> lastInventoryRenderMs{0};
+    std::atomic<std::int64_t> currentSlotFrameBucketMs{0};
+    std::atomic<int> slotsRenderedInCurrentFrame{0};
+
+    // Fixed-capacity slot cache populated during InventoryItemRenderer::render (zero per-frame heap allocation)
+    static constexpr std::size_t kMaxTrackedSlots = 128;
+    std::array<DetectedSlotRect, kMaxTrackedSlots> frameSlots{};
+    std::atomic<std::size_t> frameSlotCount{0};
+
+    // Active Green Slot Hover box in physical screen pixels
+    std::atomic<bool> hasHoveredSlot{false};
+    std::atomic<float> hoveredSlotX{0.0f};
+    std::atomic<float> hoveredSlotY{0.0f};
+    std::atomic<float> hoveredSlotW{0.0f};
+    std::atomic<float> hoveredSlotH{0.0f};
 
     // Deduplication state between pl::input callback and AInputQueue_getEvent hook
     std::atomic<std::int64_t> lastTouchEventMs{0};
@@ -54,12 +81,22 @@ struct RuntimeTouchState {
     std::atomic<float> lastRawEventX{-1.0f};
     std::atomic<float> lastRawEventY{-1.0f};
 
-    // Active touch pointer ID and virtual cursor coordinates
+    // Active touch pointer ID and persistent Windows-style Mobile Cursor coordinates
     std::atomic<std::int32_t> activePointerId{-1};
+    std::atomic<bool> cursorInitializedInGui{false};
+    std::atomic<float> cursorX{960.0f};
+    std::atomic<float> cursorY{540.0f};
     std::atomic<float> lastTouchX{0.0f};
     std::atomic<float> lastTouchY{0.0f};
 
-    // Calibrated physical screen dimensions (pixels) - starts at 1920x1080 and self-calibrates
+    // Runtime-adjustable Mobile Cursor Settings (persisted to config.json)
+    std::atomic<bool> cursorEnabled{true};
+    std::atomic<float> cursorScale{1.00f}; // [0.75, 2.00]
+    std::atomic<bool> greenSlotHoverEnabled{true};
+    std::atomic<bool> paperDollFollowCursor{true};
+    std::atomic<bool> trackpadMode{false};
+
+    // Calibrated physical screen dimensions (pixels) - updated via eglQuerySurface & touch calibration
     std::atomic<float> screenWidth{1920.0f};
     std::atomic<float> screenHeight{1080.0f};
 
@@ -70,8 +107,6 @@ struct RuntimeTouchState {
     std::atomic<float> activeBoundsMaxY{1.0f};
 
     // Cursor-Follow target and smoothed orientation deltas (degrees)
-    // Decouples Body Yaw (~26 deg) from Head Yaw (~62 deg) and Head Pitch (~38 deg)
-    // so the character's head, neck, and eyes track the finger like a PC mouse cursor.
     std::atomic<float> targetBodyYawOffset{0.0f};
     std::atomic<float> targetHeadYawOffset{0.0f};
     std::atomic<float> targetPitchOffset{0.0f};
@@ -79,7 +114,7 @@ struct RuntimeTouchState {
     std::atomic<float> currentHeadYawOffset{0.0f};
     std::atomic<float> currentPitchOffset{0.0f};
 
-    // Diagnostic counter of rendered inventory preview frames
+    // Diagnostic counter of rendered GUI & preview frames
     std::atomic<std::uint64_t> renderedPreviewFrames{0};
 };
 
@@ -100,7 +135,7 @@ class PaperDollTouchMod {
     bool disable();
     bool unload();
 
-    // Non-consuming touch handler (always returns false so Minecraft UI slots/buttons work normally)
+    // Non-consuming touch handler (consumes ONLY when tapping inside Mobile Cursor Settings popup)
     bool onTouchEvent(int action, int pointerId, float x, float y) noexcept;
 
     // Detour for LivePlayerRenderer::render(MinecraftUIRenderContext&, IClientInstance&, UIControl&, int)
@@ -114,6 +149,33 @@ class PaperDollTouchMod {
 
     // Detour for PaperDollRenderer::render(MinecraftUIRenderContext&, IClientInstance&, UIControl&, int)
     void onPaperDollRenderDetour(
+        void *self,
+        void *renderContext,
+        void *clientInstance,
+        void *uiControl,
+        int pass
+    ) noexcept;
+
+    // Detour for GradientRenderer::render (renders modal GUI background dim on Inventory, Chest, Pause, Settings, etc.)
+    void onGradientRenderDetour(
+        void *self,
+        void *renderContext,
+        void *clientInstance,
+        void *uiControl,
+        int pass
+    ) noexcept;
+
+    // Detour for InventoryItemRenderer::render (tracks active container/inventory slots & GUI lifecycle)
+    void onInventoryItemRenderDetour(
+        void *self,
+        void *renderContext,
+        void *clientInstance,
+        void *uiControl,
+        int pass
+    ) noexcept;
+
+    // Detour for HoverRenderer::render (tracks active container slot hover)
+    void onHoverRenderDetour(
         void *self,
         void *renderContext,
         void *clientInstance,
@@ -144,13 +206,20 @@ class PaperDollTouchMod {
     // Native AInputQueue_getEvent detour
     int32_t onInputQueueGetEventDetour(void *queue, void **outEvent) noexcept;
 
+    // Native eglSwapBuffers detour for zero-shader hardware-crisp Windows Cursor, Green Slot Hover & Settings UI
+    unsigned int onEglSwapBuffersDetour(void *display, void *surface) noexcept;
+
   private:
     void sanitizeAndApplyConfig() noexcept;
+    void saveRuntimeSettingsToConfig() noexcept;
     bool tryResolveAndInstallHooks() noexcept;
     void registerInputHandlers() noexcept;
     void removeHooks() noexcept;
     void resetTouchAndOrientation(bool clearAngles) noexcept;
     void updateCursorFollowTargets(float x, float y) noexcept;
+    void updateHoveredSlotFromCursor(float cx, float cy) noexcept;
+    bool handleSettingsOverlayTouch(int maskedAction, float x, float y) noexcept;
+    void renderMobileCursorOverlay(int surfaceWidth, int surfaceHeight) noexcept;
     void stepOrientationSmoothing() noexcept;
     void applyActorPitchToComponents(const void *actorPtr) noexcept;
     void restoreActorPitchComponents() noexcept;
@@ -176,6 +245,15 @@ class PaperDollTouchMod {
     void *mPaperDollRenderTarget{nullptr};
     void *mPaperDollRenderOriginal{nullptr};
 
+    void *mGradientRenderTarget{nullptr};
+    void *mGradientRenderOriginal{nullptr};
+
+    void *mInventoryItemRenderTarget{nullptr};
+    void *mInventoryItemRenderOriginal{nullptr};
+
+    void *mHoverRenderTarget{nullptr};
+    void *mHoverRenderOriginal{nullptr};
+
     void *mPaperDollRenderGuiTarget{nullptr};
     void *mPaperDollRenderGuiOriginal{nullptr};
 
@@ -191,8 +269,11 @@ class PaperDollTouchMod {
 
     void *mInputQueueGetEventTarget{nullptr};
     void *mInputQueueGetEventOriginal{nullptr};
+    void *mEglSwapBuffersTarget{nullptr};
+    void *mEglSwapBuffersOriginal{nullptr};
     bool mPlInputCallbackRegistered{false};
     bool mInputQueueHookInstalled{false};
+    bool mEglHookInstalled{false};
 };
 
 } // namespace paperdoll
